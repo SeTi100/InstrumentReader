@@ -7,8 +7,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
 from instrument_reader.core.preprocessing import PreprocessingConfig
+from instrument_reader.core.calculation import CalculationEngine, CalculationChannel
 from instrument_reader.gui.video_widget import VideoWidget
-from instrument_reader.gui.control_panel import ControlPanel
+from instrument_reader.gui.control_panel import ControlPanel, CalculationChannelDialog
 from instrument_reader.gui.ocr_worker import OCRWorker
 from instrument_reader.gui.db_writer import DatabaseWriter
 from instrument_reader.gui.experiment_dialog import ExperimentDialog
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         
         self.db_writer = DatabaseWriter()
         self.ocr_worker = OCRWorker()
+        self.calc_engine = CalculationEngine()
         self._roi_counter = 1
         
         self.setup_ui()
@@ -100,9 +102,12 @@ class MainWindow(QMainWindow):
         self.control_panel.new_exp_btn.clicked.connect(self.create_experiment)
         self.control_panel.delete_roi_btn.clicked.connect(self.delete_roi)
         
-        self.ocr_worker.readings_ready.connect(self.control_panel.update_readings)
-        self.ocr_worker.readings_ready.connect(self.db_writer.insert_readings)
-        self.ocr_worker.readings_ready.connect(self.video_widget.update_readings)
+        self.ocr_worker.readings_ready.connect(self.on_readings_ready)
+
+        self.control_panel.add_calc_btn.clicked.connect(self.add_calculated_channel)
+        self.control_panel.edit_calc_btn.clicked.connect(self.edit_calculated_channel)
+        self.control_panel.delete_calc_btn.clicked.connect(self.delete_calculated_channel)
+        self.control_panel.calc_table.itemDoubleClicked.connect(lambda item: self.edit_calculated_channel())
 
         self.control_panel.roi_list.itemDoubleClicked.connect(self.on_roi_double_clicked)
         self.control_panel.roi_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -215,6 +220,17 @@ class MainWindow(QMainWindow):
                     except ValueError:
                         pass
 
+                # Synchronize CalculationEngine history and channel variable references
+                if old_name in self.calc_engine.history:
+                    self.calc_engine.history[updated_roi.name] = self.calc_engine.history.pop(old_name)
+
+                for ch in self.calc_engine.channels.values():
+                    for var_k, target_roi in list(ch.variables.items()):
+                        if target_roi == old_name:
+                            ch.variables[var_k] = updated_roi.name
+                    if f"{{{old_name}}}" in ch.formula:
+                        ch.formula = ch.formula.replace(f"{{{old_name}}}", f"{{{updated_roi.name}}}")
+
             self.ocr_worker.update_rois(self.video_widget.rois)
             self.video_widget._update_display()
             
@@ -303,6 +319,7 @@ class MainWindow(QMainWindow):
                 if r.get("roi_id") != del_id and r.get("roi_name") != del_name
             ]
             self.control_panel.remove_roi_reading(del_name, del_id)
+            self.calc_engine.history.pop(del_name, None)
 
             self.ocr_worker.update_rois(self.video_widget.rois)
             self.video_widget._update_display()
@@ -315,18 +332,140 @@ class MainWindow(QMainWindow):
             run_id = self.db_writer.create_run(exp_id, data["target_temp"], data["run_notes"])
             self.control_panel.exp_label.setText(f"Experiment: {exp_id} | Run: {run_id}")
             
-    def export_csv(self):
-        dlg = ExportDialog(self)
+    def on_readings_ready(self, readings, timestamp=None):
+        self.control_panel.update_readings(readings)
+        self.video_widget.update_readings(readings)
+
+        # Check if readings have timestamp or use parameter
+        ts = timestamp
+        if ts is None and readings and "timestamp" in readings[0] and isinstance(readings[0]["timestamp"], (int, float)):
+            ts = float(readings[0]["timestamp"])
+
+        # Feed valid readings into calculation history buffer
+        self.calc_engine.update_readings(readings, timestamp=ts)
+
+        # Build map of current values from valid readings
+        current_vals = {}
+        for r in readings:
+            if r.get("roi_name") and r.get("parsed_value") is not None and r.get("is_valid", True):
+                current_vals[r["roi_name"]] = r["parsed_value"]
+
+        # Evaluate all calculated channels
+        calc_results = self.calc_engine.calculate_all(current_vals, current_time=ts)
+        self.control_panel.update_calculated_readings(calc_results)
+
+        # Prepare combined readings for database logging
+        all_readings = list(readings)
+        for res in calc_results:
+            all_readings.append({
+                "roi_id": res.channel_id,
+                "roi_name": res.name,
+                "raw_text": res.formula,
+                "parsed_value": res.value,
+                "unit": res.unit,
+                "confidence": 1.0,
+                "is_valid": res.is_valid,
+                "reason": res.error_message or "",
+                "used_fallback": False,
+                "is_child": False,
+                "is_calculated": 1,
+            })
+
+        self.db_writer.insert_readings(all_readings)
+
+    def _get_current_evaluation_values(self):
+        current_vals = {
+            r["roi_name"]: r["parsed_value"]
+            for r in self.video_widget.latest_readings
+            if r.get("parsed_value") is not None and r.get("is_valid", True)
+        }
+        for res in self.calc_engine.latest_results.values():
+            if res.is_valid and res.value is not None:
+                current_vals[res.name] = res.value
+        return current_vals
+
+    def add_calculated_channel(self):
+        rois = [r.name for r in self.video_widget.rois if r.name]
+        current_vals = self._get_current_evaluation_values()
+        dlg = CalculationChannelDialog(
+            channel=None,
+            available_rois=rois,
+            current_readings=current_vals,
+            calc_engine=self.calc_engine,
+            parent=self,
+        )
         if dlg.exec():
-            run_id, path = dlg.get_data()
+            ch = dlg.get_channel_data()
+            self.calc_engine.add_channel(ch)
+            self.control_panel.set_calculated_channels(list(self.calc_engine.channels.values()))
+            calc_results = self.calc_engine.calculate_all(current_vals)
+            self.control_panel.update_calculated_readings(calc_results)
+
+    def edit_calculated_channel(self):
+        row = self.control_panel.calc_table.currentRow()
+        if row < 0:
+            return
+
+        item = self.control_panel.calc_table.item(row, 0)
+        ch_id = item.data(Qt.UserRole) if item else None
+        ch = self.calc_engine.get_channel(ch_id) if ch_id else None
+        if ch is None:
+            channels = list(self.calc_engine.channels.values())
+            if row < len(channels):
+                ch = channels[row]
+
+        if ch:
+            rois = [r.name for r in self.video_widget.rois if r.name]
+            current_vals = self._get_current_evaluation_values()
+            dlg = CalculationChannelDialog(
+                channel=ch,
+                available_rois=rois,
+                current_readings=current_vals,
+                calc_engine=self.calc_engine,
+                parent=self,
+            )
+            if dlg.exec():
+                updated_ch = dlg.get_channel_data()
+                self.calc_engine.add_channel(updated_ch)
+                self.control_panel.set_calculated_channels(list(self.calc_engine.channels.values()))
+                calc_results = self.calc_engine.calculate_all(current_vals)
+                self.control_panel.update_calculated_readings(calc_results)
+
+    def delete_calculated_channel(self):
+        row = self.control_panel.calc_table.currentRow()
+        if row < 0:
+            return
+
+        item = self.control_panel.calc_table.item(row, 0)
+        ch_id = item.data(Qt.UserRole) if item else None
+        ch = self.calc_engine.get_channel(ch_id) if ch_id else None
+        if ch is None:
+            channels = list(self.calc_engine.channels.values())
+            if row < len(channels):
+                ch = channels[row]
+
+        if ch:
+            self.calc_engine.remove_channel(ch.id)
+            self.control_panel.set_calculated_channels(list(self.calc_engine.channels.values()))
+            current_vals = self._get_current_evaluation_values()
+            calc_results = self.calc_engine.calculate_all(current_vals)
+            self.control_panel.update_calculated_readings(calc_results)
+
+    def export_csv(self):
+        dlg = ExportDialog(self, db=self.db_writer.db, current_run_id=self.db_writer.current_run_id)
+        if dlg.exec():
+            data = dlg.get_data()
+            run_id = data[0]
+            path = data[1]
+            channels = data[2] if len(data) > 2 else None
             try:
-                self.db_writer.db.export_csv(path, run_id)
+                self.db_writer.db.export_csv(path, run_id, channels)
                 QMessageBox.information(self, "Success", f"Exported to {path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
                 
     def save_roi_preset(self):
-        if not self.video_widget.rois:
+        if not self.video_widget.rois and not self.calc_engine.channels:
             return
         
         name, ok = QInputDialog.getText(self, "Save Preset", "Enter preset name:")
@@ -362,7 +501,14 @@ class MainWindow(QMainWindow):
                 "core_width_pct": getattr(r, "core_width_pct", 0.6),
                 "min_float_height": getattr(r, "min_float_height", 8)
             })
-        jstr = json.dumps(rois_dict)
+
+        calc_dict = [ch.to_dict() for ch in self.calc_engine.channels.values()]
+
+        preset_data = {
+            "rois": rois_dict,
+            "calculated_channels": calc_dict,
+        }
+        jstr = json.dumps(preset_data)
         self.db_writer.save_roi_preset(name, jstr)
         QMessageBox.information(self, "Success", "Preset saved.")
         
@@ -380,7 +526,14 @@ class MainWindow(QMainWindow):
         selected_preset = next(p for p in presets if p[1] == name)
         jstr = selected_preset[2]
         
-        rois_dict = json.loads(jstr)
+        parsed_data = json.loads(jstr)
+        if isinstance(parsed_data, dict) and "rois" in parsed_data:
+            rois_dict = parsed_data["rois"]
+            calc_dict = parsed_data.get("calculated_channels", [])
+        else:
+            rois_dict = parsed_data
+            calc_dict = []
+
         self.video_widget.rois.clear()
         self.control_panel.roi_list.clear()
         
@@ -436,6 +589,13 @@ class MainWindow(QMainWindow):
             
         self.ocr_worker.update_rois(self.video_widget.rois)
         self.video_widget._update_display()
+
+        # Re-populate calculated channels
+        self.calc_engine.clear_channels()
+        for cd in calc_dict:
+            ch = CalculationChannel.from_dict(cd)
+            self.calc_engine.add_channel(ch)
+        self.control_panel.set_calculated_channels(list(self.calc_engine.channels.values()))
 
         
     def closeEvent(self, event):

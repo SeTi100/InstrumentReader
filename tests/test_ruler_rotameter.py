@@ -534,3 +534,101 @@ def test_preprocessing_dialog_suppress_scale_toggle(qtbot):
 
     updated_config = dlg.get_config()
     assert updated_config.suppress_scale_marks is False
+
+
+def test_preprocessing_dialog_debug_toggle(qtbot):
+    img = np.ones((200, 60, 3), dtype=np.uint8) * 220
+    # Scale tick at y=30
+    img[30:32, 5:25] = 20
+    # Float at y=120..170
+    img[120:170, 15:45] = 25
+
+    config = PreprocessingConfig(
+        grayscale=True,
+        suppress_scale_marks=True,
+        core_width_pct=0.6,
+        min_float_height=8
+    )
+    dlg = PreprocessingDialog(img, config)
+    qtbot.addWidget(dlg)
+    dlg.show()
+
+    assert hasattr(dlg, "show_debug_cb")
+    assert dlg.show_debug_cb.isChecked() is False
+    assert hasattr(dlg, "profile_plot")
+    assert dlg.profile_plot.isHidden() is True
+    assert len(dlg.debug_overlay_items) == 0
+
+    # 1. Activate debug visualization (2D mode)
+    dlg.show_debug_cb.setChecked(True)
+    assert dlg.profile_plot.isHidden() is False
+    assert dlg.float_line_item is not None
+    assert abs(dlg.float_line_item.line().y1() - 120.0) <= 2.0
+    assert dlg.float_box_item is not None
+    assert len(dlg.debug_overlay_items) > 0  # Core bounds, rejected ticks, curves
+    assert "2D-Objektfilter" in dlg.float_status_label.text()
+    assert "Blobs:" in dlg.float_status_label.text()
+    # Scene bounds expand to include side-plot
+    assert dlg.scene.sceneRect().width() > 100
+
+    # 2. Switch to 1D gradient debug mode
+    dlg.suppress_scale_cb.setChecked(False)
+    assert dlg.profile_plot.isHidden() is False
+    assert dlg.float_line_item is not None
+    assert abs(dlg.float_line_item.line().y1() - 30.0) <= 3.0
+    assert dlg.float_box_item is None
+    assert len(dlg.debug_overlay_items) > 0  # 1D margin lines, candidate lines, labels
+    assert "1D-Gradient" in dlg.float_status_label.text()
+    assert "1D-Peaks:" in dlg.float_status_label.text()
+
+    # Verify horizontal candidate lines include both red selected line and orange dashed lines
+    from PySide6.QtWidgets import QGraphicsLineItem
+    from PySide6.QtCore import Qt
+    line_overlays = [it for it in dlg.debug_overlay_items if isinstance(it, QGraphicsLineItem) and it.line().y1() == it.line().y2()]
+    assert len(line_overlays) >= 2
+    # At least one bold solid red line for selected peak
+    red_selected = [l for l in line_overlays if l.pen().color().red() > 200 and l.pen().color().green() < 100 and l.pen().style() == Qt.SolidLine]
+    assert len(red_selected) >= 1
+
+    # 3. Deactivate debug visualization and float line
+    dlg.show_debug_cb.setChecked(False)
+    dlg.show_float_cb.setChecked(False)
+    assert dlg.profile_plot.isHidden() is True
+    assert len(dlg.debug_overlay_items) == 0
+    assert dlg.float_line_item is None
+    assert dlg.float_status_label.text() == "Float Position: -"
+    # Scene bounds contract back to crop rect (width=60, height=200)
+    assert dlg.scene.sceneRect().width() == 60.0
+    assert dlg.scene.sceneRect().height() == 200.0
+
+
+def test_process_ruler_roi_debug_output():
+    from instrument_reader.core.analog_reader import RotameterRulerReader
+    from instrument_reader.core.roi import ROIConfig, ROIShape
+
+    frame = np.ones((300, 300, 3), dtype=np.uint8) * 200
+    # Axis from (150, 250) to (150, 50)
+    # Put float body at row 150
+    frame[140:170, 135:165] = 20
+
+    ruler = ROIConfig(
+        name="Ruler_Debug_Test",
+        shape=ROIShape.RULER,
+        coordinates=[[150, 50], [150, 250]],
+        strip_width=40.0,
+        calibration_marks=[{"pos": 0.0, "value": 0.0}, {"pos": 1.0, "value": 100.0}],
+        suppress_scale_marks=True
+    )
+
+    reader = RotameterRulerReader()
+    rel_pos, val, edge_pts, debug = reader.process_ruler_roi(frame, ruler, return_debug=True)
+
+    assert rel_pos is not None
+    assert val is not None
+    assert edge_pts is not None
+    assert debug is not None
+    assert isinstance(debug, dict)
+    assert "mode" in debug
+    assert "candidates_1d" in debug
+    assert "profile" in debug
+

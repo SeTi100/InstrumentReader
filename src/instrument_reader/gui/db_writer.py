@@ -50,12 +50,14 @@ class DatabaseWriter(QObject):
                 cursor.execute("""
                     INSERT INTO readings (run_id, timestamp, phase_status, roi_name, 
                                           raw_ocr_text, parsed_value, unit, confidence, 
-                                          is_valid, validation_reason, used_fallback)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          is_valid, validation_reason, used_fallback, is_calculated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     self.current_run_id, now_str, self.current_phase, r["roi_name"],
-                    r["raw_text"], r["parsed_value"], r.get("unit", ""), r["confidence"],
-                    1 if r["is_valid"] else 0, r.get("reason", ""), 1 if r.get("used_fallback") else 0
+                    r.get("raw_text", ""), r["parsed_value"], r.get("unit", ""), r.get("confidence", 1.0),
+                    1 if r.get("is_valid", True) else 0, r.get("reason", ""),
+                    1 if r.get("used_fallback") else 0,
+                    1 if r.get("is_calculated") else 0
                 ))
                 
     def save_roi_preset(self, name, config_json):

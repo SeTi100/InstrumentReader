@@ -1,16 +1,18 @@
+from typing import Optional, Dict, Any, List, Tuple
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QSlider, QCheckBox, 
     QComboBox, QDialogButtonBox, QLabel, QDoubleSpinBox, QSpinBox, 
     QPushButton, QListWidget, QGraphicsView, QGraphicsScene, 
-    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsLineItem, QSplitter, 
+    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsLineItem, 
+    QGraphicsSimpleTextItem, QGraphicsPathItem, QSplitter, 
     QGroupBox, QScrollArea, QWidget, QRadioButton, QButtonGroup
 )
 from PySide6.QtCore import Qt, QRectF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainter, QMouseEvent
+from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainter, QMouseEvent, QPainterPath, QFont
 import cv2
 import numpy as np
 from instrument_reader.core.preprocessing import PreprocessingPipeline, PreprocessingConfig
-from instrument_reader.core.analog_reader import RotameterReader
+from instrument_reader.core.analog_reader import RotameterReader, RotameterRulerReader
 
 class ZoomableGraphicsView(QGraphicsView):
     mask_created = Signal(int, int, int, int)  # x, y, w, h in scene coordinates
@@ -89,7 +91,131 @@ class ZoomableGraphicsView(QGraphicsView):
             super().mouseReleaseEvent(event)
             return
 
-        super().mouseReleaseEvent(event)
+class ProfilePlotWidget(QWidget):
+    """
+    Mini-plot displaying 1D intensity profile I(y) and vertical gradient dI/dy
+    aligned with the tube height y.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self.setMaximumHeight(220)
+        self.debug_info: Optional[Dict[str, Any]] = None
+
+    def set_data(self, debug_info: Optional[Dict[str, Any]]):
+        self.debug_info = debug_info
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+
+        # Dark background
+        painter.fillRect(0, 0, w, h, QColor(25, 27, 32))
+        painter.setPen(QPen(QColor(60, 65, 75), 1))
+        painter.drawRect(0, 0, w - 1, h - 1)
+
+        if not self.debug_info or self.debug_info.get("profile") is None:
+            painter.setPen(QColor(140, 145, 155))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Keine Profildaten vorhanden")
+            return
+
+        profile = self.debug_info.get("profile")
+        grad = self.debug_info.get("grad_full")
+        if grad is None and self.debug_info.get("gradient") is not None:
+            grad = self.debug_info.get("gradient")
+        
+        y_float = self.debug_info.get("y_float")
+        candidates = self.debug_info.get("candidates_1d", [])
+        
+        img_len = len(profile)
+        if img_len < 2:
+            return
+
+        # Margins for axes / labels
+        left_m = 35
+        right_m = 15
+        top_m = 24
+        bottom_m = 12
+        plot_w = max(10, w - left_m - right_m)
+        plot_h = max(10, h - top_m - bottom_m)
+
+        # Draw Title & Legend
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        painter.setPen(QColor(80, 190, 255))
+        painter.drawText(left_m, 16, "— I(y)")
+
+        painter.setPen(QColor(255, 160, 40))
+        painter.drawText(left_m + 65, 16, "— dI/dy")
+
+        if y_float is not None:
+            painter.setPen(QColor(255, 60, 60))
+            painter.drawText(left_m + 130, 16, "— Float y")
+
+        # Zero center line for gradient
+        cx = left_m + plot_w / 2.0
+        painter.setPen(QPen(QColor(50, 55, 65), 1, Qt.DashLine))
+        painter.drawLine(int(cx), top_m, int(cx), top_m + plot_h)
+
+        # Plot paths
+        path_prof = QPainterPath()
+        path_grad = QPainterPath()
+
+        max_g = float(np.max(np.abs(grad))) if grad is not None and len(grad) > 0 else 1.0
+        if max_g < 1e-3:
+            max_g = 1.0
+
+        for i in range(img_len):
+            py = top_m + (i / float(img_len - 1)) * plot_h
+            # Intensity x
+            px = left_m + (float(profile[i]) / 255.0) * plot_w
+            if i == 0:
+                path_prof.moveTo(px, py)
+            else:
+                path_prof.lineTo(px, py)
+
+            # Gradient x (centered)
+            if grad is not None and i < len(grad):
+                gx = cx + (float(grad[i]) / max_g) * (plot_w / 2.0) * 0.95
+                if i == 0:
+                    path_grad.moveTo(gx, py)
+                else:
+                    path_grad.lineTo(gx, py)
+
+        # Draw intensity curve
+        pen_prof = QPen(QColor(70, 170, 240, 200), 1.5)
+        painter.setPen(pen_prof)
+        painter.drawPath(path_prof)
+
+        # Draw gradient curve
+        pen_grad = QPen(QColor(255, 150, 30, 220), 1.5)
+        painter.setPen(pen_grad)
+        painter.drawPath(path_grad)
+
+        # Draw candidate lines
+        for cand in candidates:
+            cy = cand.get("y")
+            if cy is not None and 0 <= cy < img_len:
+                p_y = top_m + (cy / float(img_len - 1)) * plot_h
+                is_sel = cand.get("selected", False)
+                if not is_sel:
+                    painter.setPen(QPen(QColor(255, 160, 0, 160), 1, Qt.DashLine))
+                    painter.drawLine(left_m, int(p_y), left_m + plot_w, int(p_y))
+
+        # Draw selected float line
+        if y_float is not None and 0 <= y_float < img_len:
+            p_y = top_m + (y_float / float(img_len - 1)) * plot_h
+            painter.setPen(QPen(QColor(255, 40, 40), 2, Qt.SolidLine))
+            painter.drawLine(left_m - 4, int(p_y), left_m + plot_w + 4, int(p_y))
+            painter.setPen(QColor(255, 80, 80))
+            painter.drawText(2, int(p_y) + 4, f"{int(round(y_float))}")
+
 
 class PreprocessingDialog(QDialog):
     def __init__(self, crop: np.ndarray, config: PreprocessingConfig, parent=None):
@@ -119,6 +245,7 @@ class PreprocessingDialog(QDialog):
         self.mask_outline_items = []
         self.float_line_item = None
         self.float_box_item = None
+        self.debug_overlay_items = []
         self.first_fit_done = False
 
         # Main Layout
@@ -314,7 +441,20 @@ class PreprocessingDialog(QDialog):
         filter_params_layout.addWidget(self.min_height_spin)
         rot_layout.addLayout(filter_params_layout)
 
+        self.show_debug_cb = QCheckBox("Debug-Visualisierung anzeigen")
+        self.show_debug_cb.setToolTip(
+            "Zeigt detaillierte visuelle Diagnose-Informationen: gefundene Peaks, Gradientenwerte, Blobs und Schnittgrenzen."
+        )
+        self.show_debug_cb.setChecked(False)
+        self.show_debug_cb.toggled.connect(self._on_debug_toggled)
+        rot_layout.addWidget(self.show_debug_cb)
+
+        self.profile_plot = ProfilePlotWidget()
+        self.profile_plot.setVisible(False)
+        rot_layout.addWidget(self.profile_plot)
+
         self.float_status_label = QLabel("Float Position: -")
+        self.float_status_label.setWordWrap(True)
         rot_layout.addWidget(self.float_status_label)
         right_layout.addWidget(rotameter_group)
 
@@ -352,6 +492,11 @@ class PreprocessingDialog(QDialog):
         self._refresh_mask_list()
         self.update_preview()
 
+    def _on_debug_toggled(self, checked: bool):
+        self.update_preview()
+        if checked:
+            self.fit_view()
+
     def _on_mode_toggled(self):
         if self.draw_radio.isChecked():
             self.view.set_mode("draw_mask")
@@ -359,7 +504,10 @@ class PreprocessingDialog(QDialog):
             self.view.set_mode("nav")
 
     def fit_view(self):
-        if self.pixmap_item and not self.pixmap_item.pixmap().isNull():
+        is_debug = hasattr(self, "show_debug_cb") and self.show_debug_cb.isChecked()
+        if is_debug and not self.scene.sceneRect().isEmpty():
+            self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        elif self.pixmap_item and not self.pixmap_item.pixmap().isNull():
             self.view.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
 
     def _on_mask_selection_changed(self, row: int):
@@ -482,15 +630,30 @@ class PreprocessingDialog(QDialog):
                 self.scene.addItem(rect_item)
                 self.mask_outline_items.append(rect_item)
 
-        # Rotameter Float Line & Float Body Box
+        # Rotameter Float Line, Float Body Box & Debug Overlays
         if self.float_line_item:
             self.scene.removeItem(self.float_line_item)
             self.float_line_item = None
         if self.float_box_item:
             self.scene.removeItem(self.float_box_item)
             self.float_box_item = None
+        if hasattr(self, "debug_overlay_items"):
+            for item in self.debug_overlay_items:
+                try:
+                    self.scene.removeItem(item)
+                except Exception:
+                    pass
+            self.debug_overlay_items.clear()
+        else:
+            self.debug_overlay_items = []
 
-        if self.show_float_cb.isChecked():
+        is_float_active = self.show_float_cb.isChecked()
+        is_debug_active = hasattr(self, "show_debug_cb") and self.show_debug_cb.isChecked()
+
+        if hasattr(self, "profile_plot"):
+            self.profile_plot.setVisible(is_debug_active)
+
+        if is_float_active or is_debug_active:
             edge_mode = self.edge_mode_combo.currentData() if hasattr(self, "edge_mode_combo") else "top"
             suppress = self.suppress_scale_cb.isChecked() if hasattr(self, "suppress_scale_cb") else True
             core_pct = (self.core_width_spin.value() / 100.0) if hasattr(self, "core_width_spin") else 0.6
@@ -501,21 +664,38 @@ class PreprocessingDialog(QDialog):
             self.config.core_width_pct = core_pct
             self.config.min_float_height = min_h
 
-            y_float_scaled, blob_box = self.rotameter_reader.detect_float_y(
-                processed,
-                edge_mode=edge_mode,
-                suppress_scale_marks=suppress,
-                core_width_pct=core_pct,
-                min_float_height=int(min_h * scale),
-                return_box=True
-            )
+            if is_debug_active:
+                debug_info = self.rotameter_reader.detect_float_y(
+                    processed,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress,
+                    core_width_pct=core_pct,
+                    min_float_height=int(min_h * scale),
+                    return_debug=True
+                )
+                y_float_scaled = debug_info.get("y_float")
+                blob_box = debug_info.get("box")
+                debug_mode = debug_info.get("mode", "1d")
+
+                if hasattr(self, "profile_plot"):
+                    self.profile_plot.set_data(debug_info)
+            else:
+                y_float_scaled, blob_box = self.rotameter_reader.detect_float_y(
+                    processed,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress,
+                    core_width_pct=core_pct,
+                    min_float_height=int(min_h * scale),
+                    return_box=True
+                )
+                debug_info = None
+                debug_mode = "2d" if suppress else "1d"
+
             if y_float_scaled is not None:
                 y_float_unscaled = y_float_scaled / scale
                 extra_scaled = f" (scaled: {y_float_scaled:.1f})" if scale > 1 else ""
-                filter_status = "2D-Filter: ON" if suppress else "1D-Gradient: ON"
-                self.float_status_label.setText(
-                    f"Float Position: y = {y_float_unscaled:.1f} px{extra_scaled} [{filter_status}]"
-                )
+
+                # Draw main red float line
                 line_item = QGraphicsLineItem(0, y_float_scaled, w, y_float_scaled)
                 pen = QPen(QColor(255, 0, 0), 2, Qt.SolidLine)
                 pen.setCosmetic(True)
@@ -524,7 +704,7 @@ class PreprocessingDialog(QDialog):
                 self.float_line_item = line_item
 
                 # If 2D blob was detected, draw translucent green bounding box around float body
-                if blob_box is not None and suppress:
+                if blob_box is not None and (suppress or debug_mode == "2d"):
                     bx, by, bw, bh = blob_box
                     box_item = QGraphicsRectItem(bx, by, bw, bh)
                     box_pen = QPen(QColor(0, 255, 120, 220), 1, Qt.DashLine)
@@ -533,9 +713,215 @@ class PreprocessingDialog(QDialog):
                     box_item.setBrush(QColor(0, 255, 120, 35))
                     self.scene.addItem(box_item)
                     self.float_box_item = box_item
-            else:
-                self.float_status_label.setText("Float Position: Not detected")
+
+            # Detailed debug rendering in scene
+            if is_debug_active and debug_info:
+                reason = debug_info.get("reason", "")
+                mode_str = "2D-Objektfilter" if debug_mode == "2d" else "1D-Gradient"
+
+                if debug_mode == "1d":
+                    # 1D Overlays:
+                    # 1. Vertical margin lines
+                    mx = int(w * self.rotameter_reader.margin_x_pct)
+                    if mx > 0 and w - 2 * mx >= 3:
+                        for mx_pos in (mx, w - mx):
+                            m_line = QGraphicsLineItem(mx_pos, 0, mx_pos, h)
+                            m_pen = QPen(QColor(0, 190, 255, 160), 1, Qt.DashLine)
+                            m_pen.setCosmetic(True)
+                            m_line.setPen(m_pen)
+                            self.scene.addItem(m_line)
+                            self.debug_overlay_items.append(m_line)
+
+                    # 2. Horizontal candidate lines
+                    candidates = debug_info.get("candidates_1d", [])
+                    plot_x = w + 15
+                    plot_w = 70
+                    line_end_x = plot_x + plot_w
+                    label_x = line_end_x + 8
+
+                    for cand in candidates:
+                        cy = cand.get("y")
+                        g_val = cand.get("grad", 0.0)
+                        is_sel = cand.get("selected", False)
+                        if cy is not None and not is_sel:
+                            c_line = QGraphicsLineItem(0, cy, line_end_x, cy)
+                            c_pen = QPen(QColor(255, 140, 0, 190), 1, Qt.DashLine)
+                            c_pen.setCosmetic(True)
+                            c_line.setPen(c_pen)
+                            self.scene.addItem(c_line)
+                            self.debug_overlay_items.append(c_line)
+
+                            txt = QGraphicsSimpleTextItem(f"g={g_val:+.1f}")
+                            txt.setBrush(QColor(255, 160, 20))
+                            txt.setFont(QFont("sans-serif", 7))
+                            txt.setPos(label_x, cy - 6)
+                            self.scene.addItem(txt)
+                            self.debug_overlay_items.append(txt)
+                        elif cy is not None and is_sel:
+                            # Selected candidate peak: bold red line across tube and curve track
+                            c_line = QGraphicsLineItem(0, cy, line_end_x, cy)
+                            c_pen = QPen(QColor(255, 40, 40), 2, Qt.SolidLine)
+                            c_pen.setCosmetic(True)
+                            c_line.setPen(c_pen)
+                            self.scene.addItem(c_line)
+                            self.debug_overlay_items.append(c_line)
+
+                            txt = QGraphicsSimpleTextItem(f"★ Float y={cy:.0f} (g={g_val:+.1f})")
+                            txt.setBrush(QColor(255, 50, 50))
+                            txt.setFont(QFont("sans-serif", 8, QFont.Bold))
+                            txt.setPos(label_x, cy - 7)
+                            self.scene.addItem(txt)
+                            self.debug_overlay_items.append(txt)
+
+                    # Status text
+                    if y_float_scaled is not None:
+                        self.float_status_label.setText(
+                            f"Float Position: y = {y_float_unscaled:.1f} px{extra_scaled} [{mode_str}]\n"
+                            f"1D-Peaks: {len(candidates)} gefunden | Kante: {edge_mode}\n"
+                            f"Details: {reason}"
+                        )
+                    else:
+                        self.float_status_label.setText(
+                            f"Float Position: Not detected [{mode_str}]\n"
+                            f"Details: {reason}"
+                        )
+
+                else:
+                    # 2D Overlays:
+                    # 1. Vertical core strip lines
+                    core_bounds = debug_info.get("core_bounds")
+                    if core_bounds:
+                        x_start, x_end = core_bounds
+                        for cx_pos in (x_start, x_end):
+                            c_line = QGraphicsLineItem(cx_pos, 0, cx_pos, h)
+                            c_pen = QPen(QColor(0, 220, 255, 190), 1, Qt.DashLine)
+                            c_pen.setCosmetic(True)
+                            c_line.setPen(c_pen)
+                            self.scene.addItem(c_line)
+                            self.debug_overlay_items.append(c_line)
+
+                    # 2. Rejected blobs (faint yellow dotted boxes)
+                    blobs = debug_info.get("blobs", [])
+                    cand_2d = [b for b in blobs if b.get("is_float")]
+                    supp_count = len(blobs) - len(cand_2d)
+
+                    for b in blobs:
+                        if not b.get("selected"):
+                            bx, by, bw, bh = b["box"]
+                            rej_item = QGraphicsRectItem(bx, by, bw, bh)
+                            rej_pen = QPen(QColor(255, 215, 0, 160), 1, Qt.DotLine)
+                            rej_pen.setCosmetic(True)
+                            rej_item.setPen(rej_pen)
+                            rej_item.setBrush(QColor(255, 215, 0, 25))
+                            self.scene.addItem(rej_item)
+                            self.debug_overlay_items.append(rej_item)
+
+                    # Status text
+                    if y_float_scaled is not None:
+                        self.float_status_label.setText(
+                            f"Float Position: y = {y_float_unscaled:.1f} px{extra_scaled} [{mode_str}]\n"
+                            f"Blobs: {len(blobs)} ({supp_count} Striche unterdrückt, {len(cand_2d)} Schwimmer)\n"
+                            f"Details: {reason}"
+                        )
+                    else:
+                        self.float_status_label.setText(
+                            f"Float Position: Not detected [{mode_str}]\n"
+                            f"Details: {reason}"
+                        )
+
+                # 3. Synchronized Profile & Gradient track beside strip in scene
+                profile = debug_info.get("profile")
+                grad = debug_info.get("grad_full")
+                if grad is None and debug_info.get("gradient") is not None:
+                    grad = debug_info.get("gradient")
+
+                if profile is not None and len(profile) == h:
+                    plot_x = w + 15
+                    plot_w = 70
+
+                    # Background
+                    bg_rect = QGraphicsRectItem(plot_x, 0, plot_w, h)
+                    bg_pen = QPen(QColor(50, 55, 65, 100), 1)
+                    bg_pen.setCosmetic(True)
+                    bg_rect.setPen(bg_pen)
+                    bg_rect.setBrush(QColor(20, 22, 28, 140))
+                    self.scene.addItem(bg_rect)
+                    self.debug_overlay_items.append(bg_rect)
+
+                    # Center line for gradient zero
+                    zero_line = QGraphicsLineItem(plot_x + plot_w / 2.0, 0, plot_x + plot_w / 2.0, h)
+                    zero_pen = QPen(QColor(80, 85, 95, 120), 1, Qt.DotLine)
+                    zero_pen.setCosmetic(True)
+                    zero_line.setPen(zero_pen)
+                    self.scene.addItem(zero_line)
+                    self.debug_overlay_items.append(zero_line)
+
+                    # Headers
+                    t_prof = QGraphicsSimpleTextItem("I(y)")
+                    t_prof.setBrush(QColor(70, 180, 255))
+                    t_prof.setFont(QFont("sans-serif", 7))
+                    t_prof.setPos(plot_x + 5, -13)
+                    self.scene.addItem(t_prof)
+                    self.debug_overlay_items.append(t_prof)
+
+                    t_grad = QGraphicsSimpleTextItem("dI/dy")
+                    t_grad.setBrush(QColor(255, 160, 30))
+                    t_grad.setFont(QFont("sans-serif", 7))
+                    t_grad.setPos(plot_x + 35, -13)
+                    self.scene.addItem(t_grad)
+                    self.debug_overlay_items.append(t_grad)
+
+                    # Paths
+                    path_i = QPainterPath()
+                    path_g = QPainterPath()
+                    cx = plot_x + plot_w / 2.0
+                    max_g = float(np.max(np.abs(grad))) if grad is not None and len(grad) > 0 else 1.0
+                    if max_g < 1e-3:
+                        max_g = 1.0
+
+                    for yi in range(h):
+                        ix = plot_x + (float(profile[yi]) / 255.0) * plot_w
+                        if yi == 0:
+                            path_i.moveTo(ix, yi)
+                        else:
+                            path_i.lineTo(ix, yi)
+
+                        if grad is not None and yi < len(grad):
+                            gx = cx + (float(grad[yi]) / max_g) * (plot_w / 2.0) * 0.9
+                            if yi == 0:
+                                path_g.moveTo(gx, yi)
+                            else:
+                                path_g.lineTo(gx, yi)
+
+                    item_i = QGraphicsPathItem(path_i)
+                    pen_i = QPen(QColor(70, 180, 255, 200), 1)
+                    pen_i.setCosmetic(True)
+                    item_i.setPen(pen_i)
+                    self.scene.addItem(item_i)
+                    self.debug_overlay_items.append(item_i)
+
+                    item_g = QGraphicsPathItem(path_g)
+                    pen_g = QPen(QColor(255, 160, 30, 220), 1)
+                    pen_g.setCosmetic(True)
+                    item_g.setPen(pen_g)
+                    self.scene.addItem(item_g)
+                    self.debug_overlay_items.append(item_g)
+
+                # Expand scene bounds so all debug overlays, curves, and labels fit comfortably
+                items_rect = self.scene.itemsBoundingRect()
+                self.scene.setSceneRect(items_rect.adjusted(-10, -20, 20, 10))
+
+            elif not is_debug_active:
+                self.scene.setSceneRect(0, 0, w, h)
+                if y_float_scaled is not None:
+                    filter_status = "2D-Filter: ON" if suppress else "1D-Gradient: ON"
+                    self.float_status_label.setText(
+                        f"Float Position: y = {y_float_unscaled:.1f} px{extra_scaled} [{filter_status}]"
+                    )
+                else:
+                    self.float_status_label.setText("Float Position: Not detected")
         else:
+            self.scene.setSceneRect(0, 0, w, h)
             self.float_status_label.setText("Float Position: -")
 
     def get_config(self) -> PreprocessingConfig:

@@ -35,6 +35,7 @@ class Database:
         is_valid INTEGER DEFAULT 1,
         validation_reason TEXT,
         used_fallback INTEGER DEFAULT 0,
+        is_calculated INTEGER DEFAULT 0,
         FOREIGN KEY (run_id) REFERENCES runs(id)
     );
 
@@ -58,11 +59,37 @@ class Database:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript(self.SCHEMA)
+            try:
+                conn.execute("ALTER TABLE readings ADD COLUMN is_calculated INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
 
-    def export_csv(self, file_path: str, run_id: int):
+    def get_run_channels(self, run_id: int):
+        """Returns list of (roi_name, is_calculated) for the given run_id."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM readings WHERE run_id = ?", (run_id,))
+            cursor.execute("""
+                SELECT DISTINCT roi_name, is_calculated 
+                FROM readings 
+                WHERE run_id = ? 
+                ORDER BY is_calculated ASC, roi_name ASC
+            """, (run_id,))
+            return [(row[0], bool(row[1])) for row in cursor.fetchall()]
+
+    def export_csv(self, file_path: str, run_id: int, channels=None):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if channels is not None:
+                if len(channels) == 0:
+                    cursor.execute("SELECT * FROM readings WHERE run_id = ? AND 0", (run_id,))
+                else:
+                    placeholders = ",".join("?" for _ in channels)
+                    cursor.execute(
+                        f"SELECT * FROM readings WHERE run_id = ? AND roi_name IN ({placeholders})",
+                        [run_id] + list(channels)
+                    )
+            else:
+                cursor.execute("SELECT * FROM readings WHERE run_id = ?", (run_id,))
             rows = cursor.fetchall()
             col_names = [description[0] for description in cursor.description]
 

@@ -111,3 +111,172 @@ def test_interpolate_duplicate_points():
     # In-between y=150: halfway between 100 and 200 -> 15 + 0.5 * (50 - 15) = 32.5
     val_150 = RotameterReader.interpolate_value(150.0, cal_points)
     assert val_150 == pytest.approx(32.5)
+
+
+def test_detect_float_y_debug_output_2d():
+    img = np.ones((200, 60), dtype=np.uint8) * 220
+    # Add a thin scale tick at y=30 (height 2px)
+    img[30:32, 10:30] = 20
+    # Add float body at y=120..170 (height 50px)
+    img[120:170, 15:45] = 25
+
+    reader = RotameterReader(float_color="dark", suppress_scale_marks=True, min_float_height=8)
+    debug = reader.detect_float_y(img, return_debug=True)
+
+    assert isinstance(debug, dict)
+    assert debug["mode"] == "2d"
+    assert debug["y_float"] is not None
+    assert abs(debug["y_float"] - 120.0) <= 2.0
+    assert debug["box"] is not None
+    assert isinstance(debug["box"], tuple)
+    assert len(debug["box"]) == 4
+
+    assert isinstance(debug["profile"], np.ndarray)
+    assert len(debug["profile"]) == 200
+    assert isinstance(debug["gradient"], np.ndarray)
+    assert len(debug["gradient"]) == 200
+    assert isinstance(debug["pad"], int)
+    assert isinstance(debug["pad_slice"], slice)
+    assert isinstance(debug["grad_valid"], np.ndarray)
+    assert isinstance(debug["candidates_1d"], list)
+    assert len(debug["candidates_1d"]) > 0
+    # In 2D mode, tick candidates must not be selected; only candidate matching the 2D float is selected
+    tick_cands = [c for c in debug["candidates_1d"] if c["y"] < 50]
+    assert len(tick_cands) > 0
+    assert all(not c["selected"] for c in tick_cands)
+    float_cands = [c for c in debug["candidates_1d"] if abs(c["y"] - debug["y_float"]) <= 1.0]
+    assert any(c["selected"] for c in float_cands)
+
+    assert isinstance(debug["blobs"], list)
+    assert len(debug["blobs"]) >= 2  # At least tick and float body
+    # Verify selected blob
+    selected_blobs = [b for b in debug["blobs"] if b.get("selected")]
+    assert len(selected_blobs) == 1
+    assert selected_blobs[0]["is_float"] is True
+
+    # Verify rejected tick blob
+    rejected_blobs = [b for b in debug["blobs"] if not b.get("is_float")]
+    assert len(rejected_blobs) >= 1
+
+    assert debug["core_bounds"] is not None
+    assert isinstance(debug["core_bounds"], tuple)
+    assert len(debug["core_bounds"]) == 2
+    assert "2D" in debug["reason"] or "Schwimmerkörper" in debug["reason"]
+
+
+def test_detect_float_y_debug_output_1d():
+    img = np.ones((200, 60), dtype=np.uint8) * 220
+    # Scale tick at y=30
+    img[30:32, 10:30] = 20
+    # Float body at y=120..170
+    img[120:170, 15:45] = 25
+
+    reader = RotameterReader(float_color="dark", suppress_scale_marks=False)
+    debug = reader.detect_float_y(img, return_debug=True)
+
+    assert isinstance(debug, dict)
+    assert debug["mode"] == "1d"
+    assert debug["y_float"] is not None
+    # In 1D mode, snaps to the first dark transition (tick mark at y=30)
+    assert abs(debug["y_float"] - 30.0) <= 3.0
+    assert debug["box"] is None
+    assert debug["blobs"] == []
+    assert debug["core_bounds"] is None
+
+    assert isinstance(debug["profile"], np.ndarray)
+    assert isinstance(debug["gradient"], np.ndarray)
+    assert len(debug["gradient"]) == len(debug["profile"])
+    assert isinstance(debug["candidates_1d"], list)
+    assert len(debug["candidates_1d"]) > 0
+    # Verify candidate structure
+    for cand in debug["candidates_1d"]:
+        assert "y" in cand
+        assert "idx" in cand
+        assert "grad" in cand
+        assert "selected" in cand
+        assert isinstance(cand["y"], int)
+        assert isinstance(cand["grad"], float)
+        assert isinstance(cand["selected"], bool)
+
+    # Exactly one candidate should be selected
+    selected_cands = [c for c in debug["candidates_1d"] if c["selected"]]
+    assert len(selected_cands) == 1
+    assert abs(selected_cands[0]["y"] - 30) <= 3
+
+
+def test_detect_float_y_debug_empty_and_edge_cases():
+    reader = RotameterReader()
+
+    # None
+    d_none = reader.detect_float_y(None, return_debug=True)
+    assert isinstance(d_none, dict)
+    assert d_none["y_float"] is None
+    assert d_none["box"] is None
+    assert d_none["candidates_1d"] == []
+    assert d_none["blobs"] == []
+    assert isinstance(d_none["pad_slice"], slice)
+
+    # Empty 0x0
+    d_empty = reader.detect_float_y(np.zeros((0, 0), dtype=np.uint8), return_debug=True)
+    assert isinstance(d_empty, dict)
+    assert d_empty["y_float"] is None
+
+    # Small 2x2
+    d_small = reader.detect_float_y(np.zeros((2, 2), dtype=np.uint8), return_debug=True)
+    assert isinstance(d_small, dict)
+    assert d_small["y_float"] is None
+
+    # Uniform 200x60
+    d_uni = reader.detect_float_y(np.ones((200, 60), dtype=np.uint8) * 128, return_debug=True)
+    assert isinstance(d_uni, dict)
+    assert d_uni["y_float"] is None
+
+
+def test_detect_float_y_2d_fallback_to_1d():
+    # Image with ONLY thin ticks (height 2px) and no physical float
+    img = np.ones((200, 60), dtype=np.uint8) * 220
+    img[50:52, 10:30] = 20
+    img[100:102, 10:30] = 20
+
+    reader = RotameterReader(float_color="dark", suppress_scale_marks=True, min_float_height=10)
+    debug = reader.detect_float_y(img, return_debug=True)
+
+    assert isinstance(debug, dict)
+    assert debug["mode"] == "1d"  # Fell back to 1D
+    assert debug["box"] is None
+    assert len(debug["blobs"]) >= 2  # The ticks were found by 2D
+    assert all(not b["is_float"] for b in debug["blobs"])  # All rejected
+    assert "Fallback" in debug["reason"] or "keinen Schwimmerkörper" in debug["reason"]
+
+
+def test_detect_float_y_1d_center_mode():
+    img = np.ones((200, 60), dtype=np.uint8) * 220
+    # Add dark float at 80..120
+    img[80:120, 15:45] = 20
+
+    reader = RotameterReader(float_color="dark", suppress_scale_marks=False)
+    debug = reader.detect_float_y(img, edge_mode="center", return_debug=True)
+
+    assert debug["mode"] == "1d"
+    assert debug["y_float"] is not None
+    assert abs(debug["y_float"] - 100.0) <= 3.0
+    # In center mode, both top and bottom extrema are marked selected
+    sel = [c for c in debug["candidates_1d"] if c["selected"]]
+    assert len(sel) == 2
+
+
+def test_rotameter_reader_read_debug():
+    img = np.ones((200, 60), dtype=np.uint8) * 220
+    img[80:130, 15:45] = 20
+
+    reader = RotameterReader(float_color="dark", suppress_scale_marks=True, min_float_height=8)
+    cal = [(50.0, 0.0), (150.0, 100.0)]
+    y_float, val, debug = reader.read(img, cal, return_debug=True)
+
+    assert y_float is not None
+    assert abs(y_float - 80.0) <= 2.0
+    assert val is not None
+    assert 25.0 <= val <= 35.0
+    assert isinstance(debug, dict)
+    assert debug["mode"] == "2d"
+

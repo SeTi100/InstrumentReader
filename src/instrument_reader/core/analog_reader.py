@@ -1,6 +1,6 @@
 import numpy as np
 import cv2
-from typing import Optional, List, Tuple, Union, Any
+from typing import Optional, List, Tuple, Union, Any, Dict
 
 class RotameterReader:
     """
@@ -39,152 +39,24 @@ class RotameterReader:
         self.core_width_pct = core_width_pct
         self.min_float_height = min_float_height
 
-    def detect_float_y(
+    def _compute_1d_gradient(
         self,
-        image: np.ndarray,
-        edge_mode: str = "top",
-        suppress_scale_marks: Optional[bool] = None,
-        core_width_pct: Optional[float] = None,
-        min_float_height: Optional[int] = None,
-        return_box: bool = False
-    ) -> Union[Optional[float], Tuple[Optional[float], Optional[Tuple[int, int, int, int]]]]:
+        gray: np.ndarray,
+        mode: str = "top"
+    ) -> Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        np.ndarray,
+        int,
+        List[Dict[str, Any]],
+        Optional[float],
+        str
+    ]:
         """
-        Detects the float's position inside the vertical tube.
-        
-        Args:
-            image: Rectified vertical image of the tube (oriented from top to bottom).
-            edge_mode: "top" (Oberkante), "bottom" (Unterkante), or "center" (Mitte).
-            suppress_scale_marks: Whether to suppress printed scale marks using 2D object filtering.
-            core_width_pct: Fraction of tube width (centered) to analyze in 2D mode.
-            min_float_height: Minimum pixel height of the float body in 2D mode.
-            return_box: If True, returns (y_float, (x, y, w, h)) bounding box of detected float blob.
-            
-        Returns:
-            y float coordinate in pixels (or (y, box) if return_box=True), or None if no float detected.
+        Computes 1D vertical intensity profile, smoothed first derivative (gradient),
+        and candidate peak transitions.
         """
-        if image is None or image.size == 0:
-            return (None, None) if return_box else None
-
-        # Convert to grayscale if needed
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-
         h, w = gray.shape
-        if h < 5 or w < 3:
-            return (None, None) if return_box else None
-
-        suppress = self.suppress_scale_marks if suppress_scale_marks is None else suppress_scale_marks
-        core_pct = self.core_width_pct if core_width_pct is None else core_width_pct
-        min_h = self.min_float_height if min_float_height is None else min_float_height
-        mode = (edge_mode or "top").lower().strip()
-
-        # -------------------------------------------------------------
-        # 1. 2D Object Analysis / Scale Mark Suppression (when active)
-        # -------------------------------------------------------------
-        if suppress:
-            cw = max(3, int(round(w * max(0.1, min(1.0, core_pct)))))
-            cx = (w - 1) / 2.0
-            x_start = max(0, int(round(cx - (cw - 1) / 2.0)))
-            x_end = min(w, x_start + cw)
-            core_strip = gray[:, x_start:x_end]
-            ch_h, ch_w = core_strip.shape
-
-            std_dev = float(np.std(core_strip))
-            if std_dev >= 2.0 and ch_h >= 5 and ch_w >= 2:
-                unique_vals = np.unique(core_strip)
-                is_binary = len(unique_vals) <= 2 and (0 in unique_vals or 255 in unique_vals)
-
-                bin_masks = []
-                if is_binary:
-                    if self.float_color == "bright":
-                        bin_masks = [(core_strip == 255).astype(np.uint8) * 255]
-                    elif self.float_color == "dark":
-                        bin_masks = [(core_strip == 0).astype(np.uint8) * 255]
-                    else:
-                        m_dark = (core_strip == 0).astype(np.uint8) * 255
-                        m_bright = (core_strip == 255).astype(np.uint8) * 255
-                        p_dark = np.count_nonzero(m_dark) / float(ch_h * ch_w)
-                        p_bright = np.count_nonzero(m_bright) / float(ch_h * ch_w)
-                        if 0.02 <= p_dark <= 0.60 and p_bright > p_dark:
-                            bin_masks = [m_dark]
-                        elif 0.02 <= p_bright <= 0.60 and p_dark > p_bright:
-                            bin_masks = [m_bright]
-                        else:
-                            bin_masks = [m_dark, m_bright]
-                else:
-                    k_blur = 3
-                    blurred = cv2.GaussianBlur(core_strip, (k_blur, k_blur), 0)
-                    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-                    if self.float_color == "dark":
-                        bin_masks = [((blurred < otsu_val).astype(np.uint8) * 255)]
-                    elif self.float_color == "bright":
-                        bin_masks = [((blurred >= otsu_val).astype(np.uint8) * 255)]
-                    else:
-                        mask_dark = ((blurred < otsu_val).astype(np.uint8) * 255)
-                        mask_bright = ((blurred >= otsu_val).astype(np.uint8) * 255)
-                        p_dark = np.count_nonzero(mask_dark) / float(ch_h * ch_w)
-                        p_bright = np.count_nonzero(mask_bright) / float(ch_h * ch_w)
-                        if 0.02 <= p_dark <= 0.60 and p_bright > p_dark:
-                            bin_masks = [mask_dark]
-                        elif 0.02 <= p_bright <= 0.60 and p_dark > p_bright:
-                            bin_masks = [mask_bright]
-                        else:
-                            bin_masks = [mask_dark, mask_bright]
-
-                candidates = []
-                close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-
-                for m in bin_masks:
-                    closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)
-                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed, connectivity=8)
-
-                    for label_idx in range(1, num_labels):
-                        bx, by, bw, bh, barea = stats[label_idx]
-
-                        # Ignore border-spanning strips (spans nearly entire height of strip)
-                        pad = max(1, int(ch_h * 0.02))
-                        if by <= pad and (by + bh) >= ch_h - pad:
-                            continue
-
-                        # Height filter: thin scale ticks (1-3 px) are suppressed
-                        if bh < min_h:
-                            continue
-
-                        # Area filter: must be large enough to be a physical float body
-                        if barea < min_h * 2:
-                            continue
-
-                        candidates.append({
-                            "x": bx + x_start,
-                            "y": by,
-                            "w": bw,
-                            "h": bh,
-                            "area": barea,
-                            "centroid_y": float(centroids[label_idx][1])
-                        })
-
-                if candidates:
-                    # Pick largest candidate by area
-                    best = max(candidates, key=lambda c: c["area"])
-                    by = best["y"]
-                    bh = best["h"]
-                    box = (int(best["x"]), int(best["y"]), int(best["w"]), int(best["h"]))
-
-                    if mode == "bottom":
-                        y_res = float(by + bh - 1)
-                    elif mode == "center":
-                        y_res = float(by + (bh - 1) / 2.0)
-                    else:  # "top"
-                        y_res = float(by)
-
-                    return (y_res, box) if return_box else y_res
-
-        # -------------------------------------------------------------
-        # 2. 1D Gradient Profile Method (Classic mode / Fallback)
-        # -------------------------------------------------------------
         mx = int(w * self.margin_x_pct)
         if w - 2 * mx >= 3:
             strip = gray[:, mx:w-mx]
@@ -211,12 +83,12 @@ class RotameterReader:
         grad_valid = grad[valid_range]
 
         if len(grad_valid) == 0:
-            return (None, None) if return_box else None
+            return profile, grad_valid, grad, pad, [], None, "Gradientenbereich nach Randabzug leer"
 
         abs_grad = np.abs(grad_valid)
         max_mag = float(np.max(abs_grad))
         if max_mag < self.min_gradient:
-            return (None, None) if return_box else None
+            return profile, grad_valid, grad, pad, [], None, f"Maximaler Gradient ({max_mag:.1f}) unter Schwellenwert ({self.min_gradient:.1f})"
 
         thresh = max(self.min_gradient, max_mag * 0.30)
 
@@ -276,7 +148,274 @@ class RotameterReader:
             best_idx = idx_top
 
         y_res = float(best_idx + pad)
-        return (y_res, None) if return_box else y_res
+
+        candidates_1d = []
+        for idx in peak_indices:
+            val = float(grad_valid[idx])
+            y_pos = int(round(idx + pad))
+            if mode == "center":
+                is_sel = bool(idx == idx_top or idx == idx_bottom)
+            else:
+                is_sel = bool(abs(idx - best_idx) < 0.5)
+            candidates_1d.append({
+                "y": y_pos,
+                "idx": int(idx),
+                "grad": val,
+                "selected": is_sel
+            })
+
+        cand_str = ", ".join([f"y={c['y']}(g={c['grad']:+.1f})" for c in candidates_1d[:5]])
+        reason = f"1D-Gradient: Peak bei y={y_res:.1f} gewählt ({len(candidates_1d)} Peaks >= {thresh:.1f}: {cand_str})"
+        return profile, grad_valid, grad, pad, candidates_1d, y_res, reason
+
+    def detect_float_y(
+        self,
+        image: np.ndarray,
+        edge_mode: str = "top",
+        suppress_scale_marks: Optional[bool] = None,
+        core_width_pct: Optional[float] = None,
+        min_float_height: Optional[int] = None,
+        return_box: bool = False,
+        return_debug: bool = False
+    ) -> Union[
+        Optional[float],
+        Tuple[Optional[float], Optional[Tuple[int, int, int, int]]],
+        Dict[str, Any]
+    ]:
+        """
+        Detects the float's position inside the vertical tube.
+        
+        Args:
+            image: Rectified vertical image of the tube (oriented from top to bottom).
+            edge_mode: "top" (Oberkante), "bottom" (Unterkante), or "center" (Mitte).
+            suppress_scale_marks: Whether to suppress printed scale marks using 2D object filtering.
+            core_width_pct: Fraction of tube width (centered) to analyze in 2D mode.
+            min_float_height: Minimum pixel height of the float body in 2D mode.
+            return_box: If True, returns (y_float, (x, y, w, h)) bounding box of detected float blob.
+            return_debug: If True, returns a structured diagnostic dict containing:
+                          mode, y_float, box, profile, gradient, grad_full, pad,
+                          candidates_1d, blobs, core_bounds, and reason.
+            
+        Returns:
+            y float coordinate in pixels (or (y, box) if return_box=True), or debug dict if return_debug=True,
+            or None if no float detected.
+        """
+        suppress = self.suppress_scale_marks if suppress_scale_marks is None else suppress_scale_marks
+        core_pct = self.core_width_pct if core_width_pct is None else core_width_pct
+        min_h = self.min_float_height if min_float_height is None else min_float_height
+        mode = (edge_mode or "top").lower().strip()
+
+        if image is None or image.size == 0:
+            if return_debug:
+                return {
+                    "mode": "2d" if suppress else "1d",
+                    "y_float": None,
+                    "box": None,
+                    "profile": None,
+                    "gradient": None,
+                    "grad_valid": None,
+                    "grad_full": None,
+                    "pad": 0,
+                    "pad_slice": slice(0, 0),
+                    "candidates_1d": [],
+                    "blobs": [],
+                    "core_bounds": None,
+                    "reason": "Image is empty"
+                }
+            return (None, None) if return_box else None
+
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+
+        h, w = gray.shape
+        if h < 5 or w < 3:
+            if return_debug:
+                return {
+                    "mode": "2d" if suppress else "1d",
+                    "y_float": None,
+                    "box": None,
+                    "profile": None,
+                    "gradient": None,
+                    "grad_valid": None,
+                    "grad_full": None,
+                    "pad": 0,
+                    "pad_slice": slice(0, 0),
+                    "candidates_1d": [],
+                    "blobs": [],
+                    "core_bounds": None,
+                    "reason": "Image dimensions too small (< 5x3)"
+                }
+            return (None, None) if return_box else None
+
+        # -------------------------------------------------------------
+        # 1. 2D Object Analysis / Scale Mark Suppression (when active)
+        # -------------------------------------------------------------
+        all_blobs: List[Dict[str, Any]] = []
+        candidates_2d: List[Dict[str, Any]] = []
+        core_bounds: Optional[Tuple[int, int]] = None
+
+        if suppress:
+            cw = max(3, int(round(w * max(0.1, min(1.0, core_pct)))))
+            cx = (w - 1) / 2.0
+            x_start = max(0, int(round(cx - (cw - 1) / 2.0)))
+            x_end = min(w, x_start + cw)
+            core_bounds = (x_start, x_end)
+            core_strip = gray[:, x_start:x_end]
+            ch_h, ch_w = core_strip.shape
+
+            std_dev = float(np.std(core_strip))
+            if std_dev >= 2.0 and ch_h >= 5 and ch_w >= 2:
+                unique_vals = np.unique(core_strip)
+                is_binary = len(unique_vals) <= 2 and (0 in unique_vals or 255 in unique_vals)
+
+                bin_masks = []
+                if is_binary:
+                    if self.float_color == "bright":
+                        bin_masks = [(core_strip == 255).astype(np.uint8) * 255]
+                    elif self.float_color == "dark":
+                        bin_masks = [(core_strip == 0).astype(np.uint8) * 255]
+                    else:
+                        m_dark = (core_strip == 0).astype(np.uint8) * 255
+                        m_bright = (core_strip == 255).astype(np.uint8) * 255
+                        p_dark = np.count_nonzero(m_dark) / float(ch_h * ch_w)
+                        p_bright = np.count_nonzero(m_bright) / float(ch_h * ch_w)
+                        if 0.02 <= p_dark <= 0.60 and p_bright > p_dark:
+                            bin_masks = [m_dark]
+                        elif 0.02 <= p_bright <= 0.60 and p_dark > p_bright:
+                            bin_masks = [m_bright]
+                        else:
+                            bin_masks = [m_dark, m_bright]
+                else:
+                    k_blur = 3
+                    blurred = cv2.GaussianBlur(core_strip, (k_blur, k_blur), 0)
+                    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                    if self.float_color == "dark":
+                        bin_masks = [((blurred < otsu_val).astype(np.uint8) * 255)]
+                    elif self.float_color == "bright":
+                        bin_masks = [((blurred >= otsu_val).astype(np.uint8) * 255)]
+                    else:
+                        mask_dark = ((blurred < otsu_val).astype(np.uint8) * 255)
+                        mask_bright = ((blurred >= otsu_val).astype(np.uint8) * 255)
+                        p_dark = np.count_nonzero(mask_dark) / float(ch_h * ch_w)
+                        p_bright = np.count_nonzero(mask_bright) / float(ch_h * ch_w)
+                        if 0.02 <= p_dark <= 0.60 and p_bright > p_dark:
+                            bin_masks = [mask_dark]
+                        elif 0.02 <= p_bright <= 0.60 and p_dark > p_bright:
+                            bin_masks = [mask_bright]
+                        else:
+                            bin_masks = [mask_dark, mask_bright]
+
+                close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+
+                for m in bin_masks:
+                    closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed, connectivity=8)
+
+                    for label_idx in range(1, num_labels):
+                        bx, by, bw, bh, barea = stats[label_idx]
+
+                        # Ignore border-spanning strips (spans nearly entire height of strip)
+                        pad_2d = max(1, int(ch_h * 0.02))
+                        is_border = (by <= pad_2d and (by + bh) >= ch_h - pad_2d)
+
+                        # Height filter: thin scale ticks (1-3 px) are suppressed
+                        passes_height = (bh >= min_h)
+
+                        # Area filter: must be large enough to be a physical float body
+                        passes_area = (barea >= min_h * 2)
+
+                        is_float = (not is_border) and passes_height and passes_area
+
+                        blob_dict = {
+                            "box": (int(bx + x_start), int(by), int(bw), int(bh)),
+                            "area": int(barea),
+                            "is_float": bool(is_float),
+                            "selected": False,
+                        }
+                        all_blobs.append(blob_dict)
+
+                        if is_float:
+                            candidates_2d.append({
+                                "x": bx + x_start,
+                                "y": by,
+                                "w": bw,
+                                "h": bh,
+                                "area": barea,
+                                "centroid_y": float(centroids[label_idx][1]),
+                                "blob_dict": blob_dict,
+                            })
+
+                if candidates_2d:
+                    # Pick largest candidate by area
+                    best = max(candidates_2d, key=lambda c: c["area"])
+                    best["blob_dict"]["selected"] = True
+                    by = best["y"]
+                    bh = best["h"]
+                    box = (int(best["x"]), int(best["y"]), int(best["w"]), int(best["h"]))
+
+                    if mode == "bottom":
+                        y_res = float(by + bh - 1)
+                    elif mode == "center":
+                        y_res = float(by + (bh - 1) / 2.0)
+                    else:  # "top"
+                        y_res = float(by)
+
+                    if return_debug:
+                        profile, grad_valid, grad_full, pad_1d, candidates_1d, _, _ = self._compute_1d_gradient(gray, mode)
+                        suppressed_count = len(all_blobs) - len(candidates_2d)
+                        # Ensure 1D candidates do not falsely claim to be selected float in 2D mode
+                        for c in candidates_1d:
+                            c["selected"] = bool(abs(c["y"] - y_res) < 1.0)
+                        return {
+                            "mode": "2d",
+                            "y_float": y_res,
+                            "box": box,
+                            "profile": profile,
+                            "gradient": grad_full,
+                            "grad_valid": grad_valid,
+                            "grad_full": grad_full,
+                            "pad": pad_1d,
+                            "pad_slice": slice(pad_1d, h - pad_1d if pad_1d > 0 else h),
+                            "candidates_1d": candidates_1d,
+                            "blobs": all_blobs,
+                            "core_bounds": core_bounds,
+                            "reason": f"2D-Filter: Schwimmerkörper erkannt (Box={box}, Fläche={best['area']} px², {suppressed_count} Striche/Störungen unterdrückt)"
+                        }
+
+                    return (y_res, box) if return_box else y_res
+
+        # -------------------------------------------------------------
+        # 2. 1D Gradient Profile Method (Classic mode / Fallback)
+        # -------------------------------------------------------------
+        profile, grad_valid, grad_full, pad_1d, candidates_1d, y_res_1d, reason_1d = self._compute_1d_gradient(gray, mode)
+
+        if return_debug:
+            if suppress:
+                reason = f"2D-Filter fand keinen Schwimmerkörper ({len(all_blobs)} Komponenten unterdrückt) -> Fallback auf 1D: {reason_1d}"
+            else:
+                reason = reason_1d
+
+            return {
+                "mode": "1d",
+                "y_float": y_res_1d,
+                "box": None,
+                "profile": profile,
+                "gradient": grad_full,
+                "grad_valid": grad_valid,
+                "grad_full": grad_full,
+                "pad": pad_1d,
+                "pad_slice": slice(pad_1d, h - pad_1d if pad_1d > 0 else h),
+                "candidates_1d": candidates_1d,
+                "blobs": all_blobs if suppress else [],
+                "core_bounds": core_bounds if suppress else None,
+                "reason": reason
+            }
+
+        return (y_res_1d, None) if return_box else y_res_1d
 
 
     @staticmethod
@@ -359,12 +498,31 @@ class RotameterReader:
         edge_mode: str = "top",
         suppress_scale_marks: Optional[bool] = None,
         core_width_pct: Optional[float] = None,
-        min_float_height: Optional[int] = None
-    ) -> Tuple[Optional[float], Optional[float]]:
+        min_float_height: Optional[int] = None,
+        return_debug: bool = False
+    ) -> Union[
+        Tuple[Optional[float], Optional[float]],
+        Tuple[Optional[float], Optional[float], Optional[Dict[str, Any]]]
+    ]:
         """
         Detects float position and interpolates value.
-        Returns: (y_float, value)
+        Returns: (y_float, value) or (y_float, value, debug_dict) if return_debug=True.
         """
+        if return_debug:
+            debug_info = self.detect_float_y(
+                image,
+                edge_mode=edge_mode,
+                suppress_scale_marks=suppress_scale_marks,
+                core_width_pct=core_width_pct,
+                min_float_height=min_float_height,
+                return_debug=True
+            )
+            y_float = debug_info.get("y_float") if isinstance(debug_info, dict) else None
+            if y_float is None:
+                return None, None, debug_info
+            val = self.interpolate_value(y_float, calibration_points)
+            return y_float, val, debug_info
+
         y_float = self.detect_float_y(
             image,
             edge_mode=edge_mode,
@@ -561,8 +719,12 @@ class RotameterRulerReader(RotameterReader):
         self,
         frame: np.ndarray,
         roi: Any,
-        pipeline: Any = None
-    ) -> Tuple[Optional[float], Optional[float], Optional[Tuple[Tuple[float, float], Tuple[float, float]]]]:
+        pipeline: Any = None,
+        return_debug: bool = False
+    ) -> Union[
+        Tuple[Optional[float], Optional[float], Optional[Tuple[Tuple[float, float], Tuple[float, float]]]],
+        Tuple[Optional[float], Optional[float], Optional[Tuple[Tuple[float, float], Tuple[float, float]]], Optional[Dict[str, Any]]]
+    ]:
         """
         Processes a ruler ROI on a given frame:
         1. Rectifies the tube strip oriented from top to bottom (fluid to float reading edge).
@@ -572,11 +734,12 @@ class RotameterRulerReader(RotameterReader):
         5. Computes edge points in original coordinates.
 
         Returns:
-            (rel_pos, interpolated_value, edge_points)
+            (rel_pos, interpolated_value, edge_points) if not return_debug,
+            or (rel_pos, interpolated_value, edge_points, debug_info) if return_debug=True.
         """
         endpoints = self.get_endpoints_from_roi(roi)
         if endpoints is None:
-            return None, None, None
+            return (None, None, None, None) if return_debug else (None, None, None)
 
         p1, p2 = endpoints
         strip_width = getattr(roi, "strip_width", 30.0)
@@ -587,37 +750,61 @@ class RotameterRulerReader(RotameterReader):
 
         rectified = self.extract_rectified_strip(frame, p_top, p_bottom, strip_width)
         if rectified is None:
-            return None, None, None
+            return (None, None, None, None) if return_debug else (None, None, None)
 
         edge_mode = getattr(roi, "ruler_edge", "top")
         suppress_scale = getattr(roi, "suppress_scale_marks", True)
         core_pct = getattr(roi, "core_width_pct", 0.6)
         min_h = getattr(roi, "min_float_height", 8)
 
+        debug_info: Optional[Dict[str, Any]] = None
+
         if getattr(roi, "preprocessing_params", None) and pipeline is not None:
             from instrument_reader.core.preprocessing import PreprocessingConfig
             config = PreprocessingConfig.from_dict(roi.preprocessing_params)
             processed = pipeline.process(rectified, config)
             scale = max(1, getattr(config, "upscale_factor", 1))
-            y_scaled = self.detect_float_y(
-                processed,
-                edge_mode=edge_mode,
-                suppress_scale_marks=suppress_scale,
-                core_width_pct=core_pct,
-                min_float_height=int(min_h * scale)
-            )
+            if return_debug:
+                debug_info = self.detect_float_y(
+                    processed,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress_scale,
+                    core_width_pct=core_pct,
+                    min_float_height=int(min_h * scale),
+                    return_debug=True
+                )
+                y_scaled = debug_info.get("y_float")
+            else:
+                y_scaled = self.detect_float_y(
+                    processed,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress_scale,
+                    core_width_pct=core_pct,
+                    min_float_height=int(min_h * scale)
+                )
             y_float = (y_scaled / scale) if y_scaled is not None else None
         else:
-            y_float = self.detect_float_y(
-                rectified,
-                edge_mode=edge_mode,
-                suppress_scale_marks=suppress_scale,
-                core_width_pct=core_pct,
-                min_float_height=min_h
-            )
+            if return_debug:
+                debug_info = self.detect_float_y(
+                    rectified,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress_scale,
+                    core_width_pct=core_pct,
+                    min_float_height=min_h,
+                    return_debug=True
+                )
+                y_float = debug_info.get("y_float")
+            else:
+                y_float = self.detect_float_y(
+                    rectified,
+                    edge_mode=edge_mode,
+                    suppress_scale_marks=suppress_scale,
+                    core_width_pct=core_pct,
+                    min_float_height=min_h
+                )
 
         if y_float is None:
-            return None, None, None
+            return (None, None, None, debug_info) if return_debug else (None, None, None)
 
         H = rectified.shape[0]
         frac_from_top = y_float / (H - 1) if H > 1 else 0.0
@@ -628,5 +815,5 @@ class RotameterRulerReader(RotameterReader):
             interp_val = round(interp_val, roi.decimal_places)
 
         edge_pts = self.compute_edge_points(p1, p2, strip_width, rel_pos)
-        return rel_pos, interp_val, edge_pts
+        return (rel_pos, interp_val, edge_pts, debug_info) if return_debug else (rel_pos, interp_val, edge_pts)
 
