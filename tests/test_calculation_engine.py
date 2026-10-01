@@ -335,3 +335,324 @@ def test_none_propagation_waiting_for_values():
     assert "Warte auf Messwerte" in res.error_message
     assert res.formatted_value == "-"
 
+
+def test_scale_step_detector_upward_jump_no_condensation_spike():
+    engine = CalculationEngine()
+    # Channel with mass_flow_smooth: rate(Waage_korrigiert, 10) * 3600
+    ch_smooth = CalculationChannel(
+        id="smooth",
+        name="Massenstrom glatt",
+        formula="rate(Waage_korrigiert, 10) * 3600",
+        unit="g/h",
+    )
+    ch_evap = CalculationChannel(
+        id="evap",
+        name="VOC verdampft",
+        formula="VOC_verdampft",
+        unit="g",
+    )
+    engine.add_channel(ch_smooth)
+    engine.add_channel(ch_evap)
+
+    # 1. Steady baseline for 10s: mass starts at 500.0 g and evaporates at 0.01 g/s (36 g/h)
+    for i in range(11):
+        t = float(i)
+        m = 500.0 - 0.01 * t
+        engine.add_reading("Waage", m, timestamp=t)
+        res = engine.calculate_all({"Waage": m}, current_time=t)
+
+    assert engine.step_detector.stage == 1
+    assert engine.step_detector.status_text == "Stationär"
+
+    # 2. Upward step at t=11: valve opened, +0.50 g jump
+    engine.add_reading("Waage", 500.39, timestamp=11.0)
+    res_trans = engine.calculate_all({"Waage": 500.39}, current_time=11.0)
+    assert engine.step_detector.is_transition
+    assert "Stabilisierung" in engine.step_detector.status_text
+
+    # Rate during transient must remain positive and smooth (hold last steady rate)
+    res_map = {r.channel_id: r for r in res_trans}
+    assert res_map["smooth"].value is not None
+    assert res_map["smooth"].value > 0.0, "Rate must not plunge negative (condensation spike) during transient"
+    assert pytest.approx(res_map["smooth"].value, abs=5.0) == 36.0
+
+    # 3. New plateau settles at t=12 and t=13
+    engine.add_reading("Waage", 500.38, timestamp=12.0)
+    engine.calculate_all({"Waage": 500.38}, current_time=12.0)
+    engine.add_reading("Waage", 500.37, timestamp=13.0)
+    res_settled = engine.calculate_all({"Waage": 500.37}, current_time=13.0)
+
+    # Stage should increment to 2 and status back to Stationär
+    assert engine.step_detector.stage == 2
+    assert engine.step_detector.status_text == "Stationär"
+
+    # Continue steady evaporation on stage 2 for another 10s
+    for i in range(14, 25):
+        t = float(i)
+        m = 500.37 - 0.01 * (t - 13.0)
+        engine.add_reading("Waage", m, timestamp=t)
+        res_list = engine.calculate_all({"Waage": m}, current_time=t)
+        r_smooth = next(r for r in res_list if r.channel_id == "smooth")
+        assert r_smooth.is_valid
+        # Rate must NEVER be negative (condensation spike); should remain ~36 g/h
+        assert r_smooth.value > 0.0, f"Rate was negative ({r_smooth.value}) at t={t}"
+        assert pytest.approx(r_smooth.value, abs=5.0) == 36.0
+
+    # Waage_korrigiert must be strictly continuous and monotonic
+    q_corr = list(engine.history["Waage_korrigiert"])
+    for j in range(1, len(q_corr)):
+        assert q_corr[j][1] <= q_corr[j - 1][1] + 1e-4, f"Discontinuity or increase at {q_corr[j]}"
+
+    # VOC_verdampft must be strictly monotonic non-decreasing
+    q_evap = list(engine.history["VOC_verdampft"])
+    for j in range(1, len(q_evap)):
+        assert q_evap[j][1] >= q_evap[j - 1][1] - 1e-4, f"Evaporated mass dropped at {q_evap[j]}"
+
+
+def test_scale_step_detector_downward_throttling_no_phantom_spike():
+    engine = CalculationEngine()
+    ch_smooth = CalculationChannel(
+        id="smooth",
+        name="Massenstrom glatt",
+        formula="rate(Waage_korrigiert, 10) * 3600",
+        unit="g/h",
+    )
+    ch_evap = CalculationChannel(
+        id="evap",
+        name="VOC verdampft",
+        formula="VOC_verdampft",
+        unit="g",
+    )
+    engine.add_channel(ch_smooth)
+    engine.add_channel(ch_evap)
+
+    # 1. Steady baseline for 10s at 0.01 g/s (36 g/h)
+    for i in range(11):
+        t = float(i)
+        m = 400.0 - 0.01 * t
+        engine.add_reading("Waage", m, timestamp=t)
+        engine.calculate_all({"Waage": m}, current_time=t)
+
+    assert engine.step_detector.stage == 1
+
+    # 2. Downward throttling drop by -0.80 g at t=11
+    engine.add_reading("Waage", 399.09, timestamp=11.0)
+    engine.calculate_all({"Waage": 399.09}, current_time=11.0)
+    assert engine.step_detector.is_transition
+
+    # 3. Plateau settles at t=12 and t=13
+    engine.add_reading("Waage", 399.08, timestamp=12.0)
+    engine.calculate_all({"Waage": 399.08}, current_time=12.0)
+    engine.add_reading("Waage", 399.07, timestamp=13.0)
+    engine.calculate_all({"Waage": 399.07}, current_time=13.0)
+
+    assert engine.step_detector.stage == 2
+    assert engine.step_detector.status_text == "Stationär"
+
+    # Continue steady evaporation; rate must not have a huge phantom spike
+    for i in range(14, 25):
+        t = float(i)
+        m = 399.07 - 0.01 * (t - 13.0)
+        engine.add_reading("Waage", m, timestamp=t)
+        res_list = engine.calculate_all({"Waage": m}, current_time=t)
+        r_smooth = next(r for r in res_list if r.channel_id == "smooth")
+        assert r_smooth.is_valid
+        # If uncompensated, a -0.8g jump in 10s window would create a rate of > 300 g/h!
+        assert r_smooth.value < 100.0, f"Phantom evaporation peak ({r_smooth.value} g/h) detected at t={t}"
+        assert pytest.approx(r_smooth.value, abs=5.0) == 36.0
+
+    # Waage_korrigiert must be strictly continuous and monotonic
+    q_corr = list(engine.history["Waage_korrigiert"])
+    for j in range(1, len(q_corr)):
+        assert q_corr[j][1] <= q_corr[j - 1][1] + 1e-4, f"Discontinuity or increase at {q_corr[j]}"
+
+    # VOC_verdampft must be strictly monotonic non-decreasing
+    q_evap = list(engine.history["VOC_verdampft"])
+    for j in range(1, len(q_evap)):
+        assert q_evap[j][1] >= q_evap[j - 1][1] - 1e-4, f"Evaporated mass dropped at {q_evap[j]}"
+
+
+def test_scale_step_detector_shock_rejection():
+    engine = CalculationEngine()
+
+    # Steady state
+    for i in range(11):
+        t = float(i)
+        m = 300.0 - 0.01 * t
+        engine.add_reading("Waage", m, timestamp=t)
+
+    initial_offset = engine.step_detector.total_offset
+    assert engine.step_detector.stage == 1
+
+    # 1. Positive table bump / mechanical shock (+0.25 g for 1s, then immediately returns to baseline)
+    engine.add_reading("Waage", 300.14, timestamp=11.0)
+    engine.calculate_all({"Waage": 300.14}, current_time=11.0)
+    assert engine.step_detector.is_transition
+
+    # Returns to normal baseline at t=12 and settles at t=13
+    engine.add_reading("Waage", 299.88, timestamp=12.0)  # expected was 300 - 0.12 = 299.88
+    engine.calculate_all({"Waage": 299.88}, current_time=12.0)
+    engine.add_reading("Waage", 299.87, timestamp=13.0)  # expected 299.87
+    engine.calculate_all({"Waage": 299.87}, current_time=13.0)
+
+    # Positive shock must be rejected: stage stays 1, offset unchanged!
+    assert engine.step_detector.stage == 1
+    assert engine.step_detector.status_text == "Stationär"
+    assert pytest.approx(engine.step_detector.total_offset, abs=1e-3) == initial_offset
+
+    # Continue steady state
+    for i in range(14, 20):
+        t = float(i)
+        m = 300.0 - 0.01 * t
+        engine.add_reading("Waage", m, timestamp=t)
+
+    # 2. Negative table bump / shock (-0.25 g for 1s, returning to baseline)
+    engine.add_reading("Waage", 299.55, timestamp=20.0)  # baseline is 299.80, drop by 0.25g
+    engine.calculate_all({"Waage": 299.55}, current_time=20.0)
+    assert engine.step_detector.is_transition
+
+    # Returns to baseline at t=21 and settles at t=22
+    engine.add_reading("Waage", 299.79, timestamp=21.0)
+    engine.calculate_all({"Waage": 299.79}, current_time=21.0)
+    engine.add_reading("Waage", 299.78, timestamp=22.0)
+    engine.calculate_all({"Waage": 299.78}, current_time=22.0)
+
+    # Negative shock must also be rejected: stage stays 1, offset unchanged!
+    assert engine.step_detector.stage == 1
+    assert engine.step_detector.status_text == "Stationär"
+    assert pytest.approx(engine.step_detector.total_offset, abs=1e-3) == initial_offset
+
+
+def test_scale_step_detector_early_downward_throttling():
+    """Ensure downward step is detected even before 3 steady points are accumulated."""
+    engine = CalculationEngine()
+    ch_smooth = CalculationChannel(
+        id="smooth",
+        name="Massenstrom glatt",
+        formula="rate(Waage_korrigiert, 10) * 3600",
+        unit="g/h",
+    )
+    engine.add_channel(ch_smooth)
+
+    engine.add_reading("Waage", 400.0, timestamp=0.0)
+    engine.add_reading("Waage", 399.99, timestamp=1.0)
+    # Early downward step by -0.50g at t=2
+    engine.add_reading("Waage", 399.49, timestamp=2.0)
+    res = engine.calculate_all({"Waage": 399.49}, current_time=2.0)
+    assert engine.step_detector.is_transition
+
+    # Settle at t=3 and t=4
+    engine.add_reading("Waage", 399.48, timestamp=3.0)
+    engine.calculate_all({"Waage": 399.48}, current_time=3.0)
+    engine.add_reading("Waage", 399.47, timestamp=4.0)
+    engine.calculate_all({"Waage": 399.47}, current_time=4.0)
+
+    assert engine.step_detector.stage == 2
+    assert engine.step_detector.status_text == "Stationär"
+
+
+def test_scale_step_detector_cascaded_transitions():
+    """Rapid double-turn transition where user turns valve, pauses briefly, and turns again."""
+    engine = CalculationEngine()
+    for i in range(11):
+        t = float(i)
+        engine.add_reading("Waage", 500.0 - 0.01 * t, timestamp=t)
+        engine.calculate_all({"Waage": 500.0 - 0.01 * t}, current_time=t)
+
+    assert engine.step_detector.stage == 1
+
+    # First turn: +0.25g at t=11.0
+    engine.add_reading("Waage", 500.14, timestamp=11.0)
+    engine.calculate_all({"Waage": 500.14}, current_time=11.0)
+    assert engine.step_detector.is_transition
+
+    # Pause at t=11.5
+    engine.add_reading("Waage", 500.14, timestamp=11.5)
+    engine.calculate_all({"Waage": 500.14}, current_time=11.5)
+
+    # Second turn: another +0.30g at t=12.0 (total +0.55g)
+    engine.add_reading("Waage", 500.44, timestamp=12.0)
+    engine.calculate_all({"Waage": 500.44}, current_time=12.0)
+    assert engine.step_detector.is_transition
+
+    # Settle at t=13.0 and t=14.0
+    engine.add_reading("Waage", 500.43, timestamp=13.0)
+    engine.calculate_all({"Waage": 500.43}, current_time=13.0)
+    engine.add_reading("Waage", 500.42, timestamp=14.0)
+    engine.calculate_all({"Waage": 500.42}, current_time=14.0)
+
+    assert engine.step_detector.stage == 2
+    assert engine.step_detector.status_text == "Stationär"
+
+    # Total offset should encompass the full cascaded jump (~0.55g)
+    assert pytest.approx(engine.step_detector.total_offset, abs=0.05) == 0.55
+
+
+def test_scale_step_detector_calculate_all_direct_feed():
+    """calculate_all called standalone updates scale readings and publishes virtual channels."""
+    engine = CalculationEngine()
+    res1 = engine.calculate_all({"Waage": 500.0}, current_time=0.0)
+    assert engine.step_detector.has_readings
+    assert pytest.approx(engine.step_detector.corrected_mass, 1e-4) == 500.0
+
+    # Next reading fed via calculate_all directly (steady evaporation of 0.10g over 10s)
+    res2 = engine.calculate_all({"Waage": 499.90}, current_time=10.0)
+    assert pytest.approx(engine.step_detector.corrected_mass, 1e-4) == 499.90
+    assert pytest.approx(engine.step_detector.evaporated_mass, 1e-4) == 0.10
+
+
+def test_scale_step_detector_refill():
+    engine = CalculationEngine()
+    ch_evap = CalculationChannel(
+        id="evap",
+        name="VOC verdampft",
+        formula="VOC_verdampft",
+        unit="g",
+    )
+    engine.add_channel(ch_evap)
+
+    # Steady evaporation from 100g down to 99.90g
+    for i in range(11):
+        t = float(i)
+        m = 100.0 - 0.01 * t
+        engine.add_reading("Waage", m, timestamp=t)
+        res = engine.calculate_all({"Waage": m}, current_time=t)
+
+    r_evap_pre = next(r for r in res if r.channel_id == "evap")
+    assert pytest.approx(r_evap_pre.value, abs=1e-2) == 0.10
+
+    # User refills 150g VOC at t=11 (from 99.90g to 249.90g)
+    engine.add_reading("Waage", 249.90, timestamp=11.0)
+    engine.calculate_all({"Waage": 249.90}, current_time=11.0)
+    assert engine.step_detector.transient_type == "REFILL"
+
+    # Settles at t=12 and t=13
+    engine.add_reading("Waage", 249.89, timestamp=12.0)
+    engine.calculate_all({"Waage": 249.89}, current_time=12.0)
+    engine.add_reading("Waage", 249.88, timestamp=13.0)
+    res_settled = engine.calculate_all({"Waage": 249.88}, current_time=13.0)
+
+    # Refill must NOT increment stage!
+    assert engine.step_detector.stage == 1
+    assert engine.step_detector.status_text == "Stationär"
+
+    # Cumulative evaporation must remain continuous (around 0.13 g, NOT negative!)
+    r_evap_post = next(r for r in res_settled if r.channel_id == "evap")
+    assert pytest.approx(r_evap_post.value, abs=0.05) == 0.13
+    assert r_evap_post.value > 0.0
+
+
+def test_standard_presets_smoothed_and_cumulative():
+    presets = {p.id: p for p in get_standard_presets()}
+    assert "mass_flow_smooth" in presets
+    assert "voc_evaporated_cumulative" in presets
+
+    p_smooth = presets["mass_flow_smooth"]
+    assert p_smooth.formula == "rate(Waage_korrigiert, 10) * 3600"
+    assert p_smooth.unit == "g/h"
+
+    p_cum = presets["voc_evaporated_cumulative"]
+    assert p_cum.formula == "VOC_verdampft"
+    assert p_cum.unit == "g"
+
+

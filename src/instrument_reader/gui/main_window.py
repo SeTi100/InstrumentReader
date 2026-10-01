@@ -3,8 +3,9 @@ import uuid
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QMutex
 from instrument_reader.core.camera import OpenCVCamera
+from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
 from instrument_reader.core.preprocessing import PreprocessingConfig
 from instrument_reader.core.calculation import CalculationEngine, CalculationChannel
@@ -19,25 +20,78 @@ from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
 
 class CameraThread(QThread):
     frame_ready = Signal(object)
-    
+
     def __init__(self, camera):
         super().__init__()
         self.camera = camera
         self.running = False
-        
+        self.paused = False
+        self._lock = QMutex()
+
     def run(self):
         self.running = True
-        self.camera.open()
+        self.paused = False
+        if not getattr(self.camera, "is_opened", False) and not self.camera.open():
+            self.running = False
+            return
+
         while self.running:
+            if self.paused:
+                self.msleep(50)
+                continue
+
+            self._lock.lock()
             ret, frame = self.camera.read()
+            self._lock.unlock()
+
             if ret and frame is not None:
                 self.frame_ready.emit(frame)
-            self.msleep(int(1000 / self.camera.fps))
-            
+            else:
+                if getattr(self.camera, "is_video_file", False):
+                    self.paused = True
+
+            fps = self.camera.fps
+            interval = int(1000 / fps) if fps > 0 else 33
+            self.msleep(interval)
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    def seek(self, seconds: float):
+        self._lock.lock()
+        try:
+            if self.camera:
+                self.camera.seek(seconds)
+                if self.paused:
+                    ret, frame = self.camera.read()
+                    if ret and frame is not None:
+                        self.frame_ready.emit(frame)
+        finally:
+            self._lock.unlock()
+
+    def seek_to_frame(self, frame_num: int):
+        self._lock.lock()
+        try:
+            if self.camera:
+                self.camera.seek_to_frame(frame_num)
+                if self.paused:
+                    ret, frame = self.camera.read()
+                    if ret and frame is not None:
+                        self.frame_ready.emit(frame)
+        finally:
+            self._lock.unlock()
+
     def stop(self):
         self.running = False
         self.wait()
-        self.camera.release()
+        self._lock.lock()
+        try:
+            self.camera.release()
+        finally:
+            self._lock.unlock()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -48,6 +102,8 @@ class MainWindow(QMainWindow):
         self.db_writer = DatabaseWriter()
         self.ocr_worker = OCRWorker()
         self.calc_engine = CalculationEngine()
+        self.recorder = VideoRecorder(output_dir="recordings")
+        self.db_writer.set_phase(f"STAGE_{self.calc_engine.step_detector.stage}")
         self._roi_counter = 1
         
         self.setup_ui()
@@ -75,22 +131,56 @@ class MainWindow(QMainWindow):
         
     def setup_connections(self):
         def start_camera():
-            src_str = self.control_panel.camera_source.text()
+            src_str = self.control_panel.camera_source.text().strip()
             src = int(src_str) if src_str.isdigit() else src_str
+
+            if self.camera_thread and self.camera_thread.running:
+                if self.camera and getattr(self.camera, "_source", None) == src:
+                    if self.camera_thread.paused:
+                        if getattr(self.camera, "is_eof", lambda: False)():
+                            self.calc_engine.history.clear()
+                            self.calc_engine.reset_scale_detector(hard=False)
+                            self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+                            self.db_writer.set_phase("STAGE_1")
+                            self.camera_thread.seek_to_frame(0)
+                        self.camera_thread.resume()
+                    return
+                else:
+                    self.camera_thread.stop()
+                    self.camera_thread = None
+                    self.camera = None
+
+            if self.camera:
+                self.camera.release()
+                self.camera = None
+
             self.camera = OpenCVCamera(src)
             self.camera_thread = CameraThread(self.camera)
             self.camera_thread.frame_ready.connect(self.video_widget.update_frame)
             self.camera_thread.frame_ready.connect(self.ocr_worker.update_frame)
+            self.camera_thread.frame_ready.connect(self.recorder.write_frame)
             self.camera_thread.start()
             self.ocr_worker.start()
 
         def stop_camera():
-            if self.camera_thread:
+            if self.camera_thread and self.camera_thread.running:
+                if self.camera and getattr(self.camera, "is_video_file", False):
+                    if not self.camera_thread.paused:
+                        self.camera_thread.pause()
+                        return
                 self.camera_thread.stop()
+                self.camera_thread = None
+                self.camera = None
             self.ocr_worker.stop()
+            if self.recorder.is_recording:
+                self.recorder.stop_recording()
+                self.control_panel.set_recording(False)
 
         self.control_panel.start_btn.clicked.connect(start_camera)
         self.control_panel.stop_btn.clicked.connect(stop_camera)
+        self.control_panel.fwd_btn.clicked.connect(lambda: self.seek_video(5.0))
+        self.control_panel.back_btn.clicked.connect(lambda: self.seek_video(-5.0))
+        self.control_panel.record_btn.clicked.connect(self.toggle_recording)
         
         self.video_widget.roi_created.connect(self.on_roi_created)
         
@@ -112,7 +202,45 @@ class MainWindow(QMainWindow):
         self.control_panel.roi_list.itemDoubleClicked.connect(self.on_roi_double_clicked)
         self.control_panel.roi_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.control_panel.roi_list.customContextMenuRequested.connect(self.on_roi_context_menu)
-        
+        self.control_panel.stage_reset_requested.connect(self.on_reset_stage)
+
+    def on_reset_stage(self):
+        self.calc_engine.reset_scale_detector(hard=False)
+        self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+        self.db_writer.set_phase("STAGE_1")
+
+    def seek_video(self, seconds: float):
+        # Clear calculation engine history buffer and reset scale step detector
+        self.calc_engine.history.clear()
+        self.calc_engine.reset_scale_detector(hard=False)
+        self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+        self.db_writer.set_phase("STAGE_1")
+
+        if self.camera_thread and self.camera_thread.running:
+            self.camera_thread.seek(seconds)
+        else:
+            src_str = self.control_panel.camera_source.text().strip()
+            if src_str and not src_str.isdigit():
+                if self.camera is None or not getattr(self.camera, "is_opened", False):
+                    if self.camera:
+                        self.camera.release()
+                    self.camera = OpenCVCamera(src_str)
+                    if not self.camera.open():
+                        return
+                self.camera.seek(seconds)
+                ret, frame = self.camera.read()
+                if ret and frame is not None:
+                    self.video_widget.update_frame(frame)
+
+    def toggle_recording(self):
+        if not self.recorder.is_recording:
+            fps = self.camera.fps if self.camera else 30.0
+            self.recorder.start_recording(fps=fps)
+            self.control_panel.set_recording(True)
+        else:
+            self.recorder.stop_recording()
+            self.control_panel.set_recording(False)
+
     def setup_menus(self):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
@@ -224,6 +352,9 @@ class MainWindow(QMainWindow):
                 if old_name in self.calc_engine.history:
                     self.calc_engine.history[updated_roi.name] = self.calc_engine.history.pop(old_name)
 
+                if self.calc_engine.scale_roi_name == old_name:
+                    self.calc_engine.scale_roi_name = updated_roi.name
+
                 for ch in self.calc_engine.channels.values():
                     for var_k, target_roi in list(ch.variables.items()):
                         if target_roi == old_name:
@@ -320,6 +451,11 @@ class MainWindow(QMainWindow):
             ]
             self.control_panel.remove_roi_reading(del_name, del_id)
             self.calc_engine.history.pop(del_name, None)
+            if self.calc_engine.scale_roi_name == del_name:
+                self.calc_engine.scale_roi_name = None
+                self.calc_engine.reset_scale_detector(hard=True)
+                self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+                self.db_writer.set_phase("STAGE_1")
 
             self.ocr_worker.update_rois(self.video_widget.rois)
             self.video_widget._update_display()
@@ -331,6 +467,9 @@ class MainWindow(QMainWindow):
             exp_id = self.db_writer.create_experiment(data["exp_name"], data["voc_type"], data["exp_desc"])
             run_id = self.db_writer.create_run(exp_id, data["target_temp"], data["run_notes"])
             self.control_panel.exp_label.setText(f"Experiment: {exp_id} | Run: {run_id}")
+            self.calc_engine.reset_scale_detector(hard=True)
+            self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+            self.db_writer.set_phase("STAGE_1")
             
     def on_readings_ready(self, readings, timestamp=None):
         self.control_panel.update_readings(readings)
@@ -353,6 +492,26 @@ class MainWindow(QMainWindow):
         # Evaluate all calculated channels
         calc_results = self.calc_engine.calculate_all(current_vals, current_time=ts)
         self.control_panel.update_calculated_readings(calc_results)
+
+        # Update stage badge and db_writer phase status from step detector
+        detector = self.calc_engine.step_detector
+        if detector.has_readings:
+            if detector.is_transition:
+                phase = "STAGE_TRANSITION"
+                self.control_panel.set_stage_status(
+                    detector.stage,
+                    detector.status_text,
+                    is_transition=True,
+                    target_stage=detector.transient_target_stage,
+                )
+            else:
+                phase = f"STAGE_{detector.stage}"
+                self.control_panel.set_stage_status(
+                    detector.stage,
+                    detector.status_text,
+                    is_transition=False,
+                )
+            self.db_writer.set_phase(phase)
 
         # Prepare combined readings for database logging
         all_readings = list(readings)
@@ -382,10 +541,21 @@ class MainWindow(QMainWindow):
         for res in self.calc_engine.latest_results.values():
             if res.is_valid and res.value is not None:
                 current_vals[res.name] = res.value
+
+        detector = self.calc_engine.step_detector
+        if detector.has_readings:
+            current_vals["Waage_korrigiert"] = detector.corrected_mass
+            current_vals["VOC_verdampft"] = detector.evaporated_mass
+            current_vals["Stufe"] = float(detector.stage)
+            current_vals["Stufen_Status"] = detector.status_text
+
         return current_vals
 
     def add_calculated_channel(self):
         rois = [r.name for r in self.video_widget.rois if r.name]
+        for vr in ("Waage_korrigiert", "VOC_verdampft", "Stufe"):
+            if vr not in rois:
+                rois.append(vr)
         current_vals = self._get_current_evaluation_values()
         dlg = CalculationChannelDialog(
             channel=None,
@@ -416,6 +586,9 @@ class MainWindow(QMainWindow):
 
         if ch:
             rois = [r.name for r in self.video_widget.rois if r.name]
+            for vr in ("Waage_korrigiert", "VOC_verdampft", "Stufe"):
+                if vr not in rois:
+                    rois.append(vr)
             current_vals = self._get_current_evaluation_values()
             dlg = CalculationChannelDialog(
                 channel=ch,
@@ -599,8 +772,12 @@ class MainWindow(QMainWindow):
 
         
     def closeEvent(self, event):
+        if self.recorder.is_recording:
+            self.recorder.stop_recording()
         if self.camera_thread:
             self.camera_thread.stop()
+            self.camera_thread = None
+            self.camera = None
         self.ocr_worker.stop()
         self.db_writer.end_run()
         event.accept()

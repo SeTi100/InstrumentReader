@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QListWidget, QLabel,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QLineEdit, QScrollArea, QDialog, QDialogButtonBox,
-    QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame
+    QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame, QCheckBox
 )
 from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray
 from PySide6.QtGui import QDrag, QFont
@@ -573,6 +573,7 @@ class ControlPanel(QWidget):
     calc_channel_added = Signal(object)
     calc_channel_updated = Signal(object)
     calc_channel_deleted = Signal(str)
+    stage_reset_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -594,13 +595,54 @@ class ControlPanel(QWidget):
         source_layout.addWidget(QLabel("Source:"))
         source_layout.addWidget(self.camera_source)
         cam_layout.addLayout(source_layout)
-        self.start_btn = QPushButton("Start Camera")
-        self.stop_btn = QPushButton("Stop Camera")
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.stop_btn)
-        cam_layout.addLayout(btn_layout)
+
+        # Neutral grey button style
+        self.NEUTRAL_BTN_STYLE = (
+            "QPushButton {"
+            "  background-color: #e0e0e0; color: #202020;"
+            "  border: 1px solid #ababab; border-radius: 3px;"
+            "  padding: 4px 8px; font-size: 11px;"
+            "}"
+            "QPushButton:hover { background-color: #d4d4d4; }"
+            "QPushButton:pressed { background-color: #c8c8c8; }"
+            "QPushButton:disabled { background-color: #f0f0f0; color: #9e9e9e; border-color: #dcdcdc; }"
+        )
+
+        # Row 1: Playback Start / Stop
+        self.start_btn = QPushButton("Start / Play")
+        self.stop_btn = QPushButton("Stop / Pause")
+        self.start_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+        self.stop_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+        play_layout = QHBoxLayout()
+        play_layout.addWidget(self.start_btn)
+        play_layout.addWidget(self.stop_btn)
+        cam_layout.addLayout(play_layout)
+
+        # Row 2: Seek Backward / Forward
+        self.back_btn = QPushButton("Backwards (-5s)")
+        self.fwd_btn = QPushButton("Forward (+5s)")
+        self.back_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+        self.fwd_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+        seek_layout = QHBoxLayout()
+        seek_layout.addWidget(self.back_btn)
+        seek_layout.addWidget(self.fwd_btn)
+        cam_layout.addLayout(seek_layout)
+
+        # Row 3: Unlock Backwards Checkbox
+        self.unlock_back_cb = QCheckBox("Unlock Backwards")
+        self.unlock_back_cb.clicked.connect(self._on_unlock_back_clicked)
+        cam_layout.addWidget(self.unlock_back_cb)
+
+        # Row 4: Video Recorder
+        rec_layout = QHBoxLayout()
+        self.record_btn = QPushButton("Record")
+        self.record_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+        rec_layout.addWidget(self.record_btn)
+        cam_layout.addLayout(rec_layout)
+
         layout.addWidget(cam_group)
+
+        self.camera_source.textChanged.connect(lambda _: self.update_playback_state())
 
         # Drawing Mode
         draw_group = QGroupBox("ROI Drawing Mode")
@@ -634,6 +676,18 @@ class ControlPanel(QWidget):
         exp_layout.addWidget(self.exp_label)
         self.new_exp_btn = QPushButton("New Experiment/Run")
         exp_layout.addWidget(self.new_exp_btn)
+
+        stage_box = QHBoxLayout()
+        self.stage_badge = QLabel("Stufe 1 (Stationär)")
+        self.stage_badge.setAlignment(Qt.AlignCenter)
+        self.stage_badge.setStyleSheet(
+            "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
+        )
+        self.reset_stage_btn = QPushButton("Stufe zurücksetzen")
+        self.reset_stage_btn.clicked.connect(self._on_reset_stage_clicked)
+        stage_box.addWidget(self.stage_badge, stretch=2)
+        stage_box.addWidget(self.reset_stage_btn, stretch=1)
+        exp_layout.addLayout(stage_box)
         layout.addWidget(exp_group)
 
         # Readings Table (Draggable)
@@ -677,6 +731,7 @@ class ControlPanel(QWidget):
         outer_layout.addWidget(scroll)
 
         self.calculated_channels: List[CalculationChannel] = []
+        self.update_playback_state()
 
     def add_roi(self, roi):
         self.roi_list.addItem(roi.name)
@@ -738,3 +793,110 @@ class ControlPanel(QWidget):
             item = self.readings_table.item(row, 0)
             if item and item.text() == old_name:
                 item.setText(new_name)
+
+    def _on_reset_stage_clicked(self):
+        self.set_stage_status(1, "Stationär", is_transition=False)
+        self.stage_reset_requested.emit()
+
+    def set_stage_status(
+        self,
+        stage: int,
+        status: str = "Stationär",
+        is_transition: bool = False,
+        target_stage: Optional[int] = None,
+    ):
+        if is_transition:
+            target = target_stage or (stage + 1)
+            self.stage_badge.setText(f"Stufenwechsel {stage} → {target} ({status})")
+            self.stage_badge.setStyleSheet(
+                "background-color: #ef6c00; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
+            )
+        else:
+            self.stage_badge.setText(f"Stufe {stage} ({status})")
+            self.stage_badge.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
+            )
+
+    def is_video_source(self) -> bool:
+        s = self.camera_source.text().strip()
+        return not s.isdigit() and len(s) > 0 and not s.startswith("/dev/video")
+
+    def update_playback_state(self):
+        is_video = self.is_video_source()
+        if is_video:
+            self.fwd_btn.setEnabled(True)
+            self.unlock_back_cb.setEnabled(True)
+            self.back_btn.setEnabled(self.unlock_back_cb.isChecked())
+        else:
+            self.fwd_btn.setEnabled(False)
+            self.lock_backwards()
+            self.unlock_back_cb.setEnabled(False)
+
+    def _on_unlock_back_clicked(self):
+        if not self.is_video_source():
+            self.unlock_back_cb.setChecked(False)
+            self.back_btn.setEnabled(False)
+            return
+
+        if self.unlock_back_cb.isChecked():
+            reply = QMessageBox.warning(
+                self,
+                "Sicherheitswarnung / Safety Warning",
+                "Warnung: Rückwärtsspulen während aktiver Messungen kann zu doppelten Datensätzen "
+                "oder nicht-monotonen Zeitstempeln führen.\n\n"
+                "Warning: Backward seeking during active analysis may cause duplicate data or non-monotonic timestamps.\n\n"
+                "Möchten Sie Rückwärtsspulen wirklich freischalten / Do you want to unlock backwards seeking?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.back_btn.setEnabled(True)
+            else:
+                self.unlock_back_cb.setChecked(False)
+                self.back_btn.setEnabled(False)
+        else:
+            self.back_btn.setEnabled(False)
+
+    def unlock_backwards(self, prompt: bool = True) -> bool:
+        """Unlocks backwards seek button. If prompt is True, asks user for confirmation."""
+        if not self.is_video_source():
+            return False
+        if prompt:
+            reply = QMessageBox.warning(
+                self,
+                "Sicherheitswarnung / Safety Warning",
+                "Warnung: Rückwärtsspulen während aktiver Messungen kann zu doppelten Datensätzen "
+                "oder nicht-monotonen Zeitstempeln führen.\n\n"
+                "Warning: Backward seeking during active analysis may cause duplicate data or non-monotonic timestamps.\n\n"
+                "Möchten Sie Rückwärtsspulen wirklich freischalten / Do you want to unlock backwards seeking?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self.unlock_back_cb.setChecked(False)
+                self.back_btn.setEnabled(False)
+                return False
+        self.unlock_back_cb.setChecked(True)
+        self.back_btn.setEnabled(True)
+        return True
+
+    def lock_backwards(self):
+        self.unlock_back_cb.setChecked(False)
+        self.back_btn.setEnabled(False)
+
+    def set_recording(self, recording: bool):
+        if recording:
+            self.record_btn.setText("Stop Recording")
+            self.record_btn.setStyleSheet(
+                "QPushButton {"
+                "  background-color: #ffebee; color: #c62828; font-weight: bold;"
+                "  border: 1px solid #ef5350; border-radius: 3px;"
+                "  padding: 4px 8px; font-size: 11px;"
+                "}"
+                "QPushButton:hover { background-color: #ffcdd2; }"
+            )
+        else:
+            self.record_btn.setText("Record")
+            self.record_btn.setStyleSheet(self.NEUTRAL_BTN_STYLE)
+
+

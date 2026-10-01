@@ -110,6 +110,34 @@ def get_standard_presets() -> List[CalculationPreset]:
             decimal_places=2,
         ),
         CalculationPreset(
+            id="mass_flow_smooth",
+            name="Massenstrom glatt (stufenbereinigt)",
+            category="Massenstrom",
+            description="Stufenbereinigter Massenstrom aus Waage (-dm_corr/dt * 3600)",
+            formula="rate(Waage_korrigiert, 10) * 3600",
+            unit="g/h",
+            default_variables={"Waage_korrigiert": "Waage_korrigiert"},
+            variable_descriptions={"Waage_korrigiert": "Stufenbereinigte Masse (g)"},
+            default_constants={},
+            constant_descriptions={},
+            window_seconds=10.0,
+            decimal_places=2,
+        ),
+        CalculationPreset(
+            id="voc_evaporated_cumulative",
+            name="VOC verdampft (kumuliert)",
+            category="Massenstrom",
+            description="Kumulierte verdampfte VOC-Masse (driftfrei und stufenbereinigt)",
+            formula="VOC_verdampft",
+            unit="g",
+            default_variables={"VOC_verdampft": "VOC_verdampft"},
+            variable_descriptions={"VOC_verdampft": "Kumulierte Verdampfungsmasse (g)"},
+            default_constants={},
+            constant_descriptions={},
+            window_seconds=10.0,
+            decimal_places=2,
+        ),
+        CalculationPreset(
             id="concentration_operating",
             name="Abgaskonzentration Betriebszustand (g/m³)",
             category="Konzentration & Abgas",
@@ -433,6 +461,336 @@ class SafeFormulaEvaluator(ast.NodeVisitor):
         raise ValueError(f"Disallowed expression node: {type(node).__name__}")
 
 
+class StepDetectorState:
+    STEADY = "STEADY"
+    TRANSIENT = "TRANSIENT"
+    SETTLING = "SETTLING"
+
+
+class ScaleStepDetector:
+    def __init__(
+        self,
+        step_threshold_up: float = 0.06,
+        slope_threshold_up: float = 0.02,
+        excess_slope_down: float = -0.15,
+        step_threshold_down: float = -0.15,
+        shock_threshold: float = 0.035,
+        refill_threshold: float = 5.0,
+        window_dt: float = 1.5,
+        settling_duration: float = 1.0,
+        settling_samples: int = 2,
+    ):
+        self.step_threshold_up = step_threshold_up
+        self.slope_threshold_up = slope_threshold_up
+        self.excess_slope_down = excess_slope_down
+        self.step_threshold_down = step_threshold_down
+        self.shock_threshold = shock_threshold
+        self.refill_threshold = refill_threshold
+        self.window_dt = window_dt
+        self.settling_duration = settling_duration
+        self.settling_samples = settling_samples
+
+        self.state: str = StepDetectorState.STEADY
+        self.stage: int = 1
+        self.total_offset: float = 0.0
+        self.start_mass: Optional[float] = None
+        self.corrected_mass: Optional[float] = None
+        self.evaporated_mass: float = 0.0
+        self.status_text: str = "Stationär"
+
+        self.raw_history: deque[Tuple[float, float]] = deque()
+        self.steady_history: deque[Tuple[float, float]] = deque()
+        self.last_steady_slope: float = 0.0
+        self._has_steady_baseline: bool = False
+
+        # Transient tracking
+        self.transient_start_time: Optional[float] = None
+        self.transient_start_mass: Optional[float] = None
+        self.transient_corr_start: Optional[float] = None
+        self.transient_type: Optional[str] = None  # "UP", "DOWN", "REFILL"
+        self.transient_target_stage: Optional[int] = None
+        self.settling_start_time: Optional[float] = None
+        self.settling_points: List[Tuple[float, float]] = []
+
+        # Buffer for spliced points to update history
+        self._spliced_history: List[Tuple[float, float]] = []
+
+        # Idempotence cache
+        self._last_ts: Optional[float] = None
+        self._last_raw: Optional[float] = None
+
+    @property
+    def has_readings(self) -> bool:
+        return self.start_mass is not None
+
+    @property
+    def is_transition(self) -> bool:
+        return self.state in (StepDetectorState.TRANSIENT, StepDetectorState.SETTLING)
+
+    def reset(self, start_mass: Optional[float] = None, hard: bool = False):
+        self.state = StepDetectorState.STEADY
+        self.stage = 1
+        self.total_offset = 0.0
+        self.transient_start_time = None
+        self.transient_start_mass = None
+        self.transient_corr_start = None
+        self.transient_type = None
+        self.transient_target_stage = None
+        self.settling_start_time = None
+        self.settling_points.clear()
+        self._spliced_history.clear()
+        self.steady_history.clear()
+        self.raw_history.clear()
+        self._has_steady_baseline = False
+        self.last_steady_slope = 0.0
+        self._last_ts = None
+        self._last_raw = None
+        self.status_text = "Stationär"
+        if hard:
+            self.start_mass = start_mass
+            self.corrected_mass = start_mass
+            self.evaporated_mass = 0.0
+        else:
+            if start_mass is not None:
+                self.start_mass = start_mass
+            if self.start_mass is not None:
+                self.corrected_mass = self._last_raw if self._last_raw is not None else self.start_mass
+                self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            else:
+                self.start_mass = None
+                self.corrected_mass = None
+                self.evaporated_mass = 0.0
+
+    def get_and_clear_spliced_history(self) -> List[Tuple[float, float]]:
+        spliced = list(self._spliced_history)
+        self._spliced_history.clear()
+        return spliced
+
+    def process_reading(self, raw_mass: float, timestamp: float) -> Tuple[float, float, int, str]:
+        # Idempotent guard
+        if self._last_ts == timestamp and self._last_raw == raw_mass:
+            return (
+                self.corrected_mass if self.corrected_mass is not None else raw_mass,
+                self.evaporated_mass,
+                self.stage,
+                self.status_text,
+            )
+
+        self._last_ts = timestamp
+        self._last_raw = raw_mass
+
+        # Initialize on first reading
+        if self.start_mass is None:
+            self.start_mass = raw_mass
+            self.corrected_mass = raw_mass
+            self.evaporated_mass = 0.0
+            self.total_offset = 0.0
+            self.stage = 1
+            self.state = StepDetectorState.STEADY
+            self.status_text = "Stationär"
+            self.raw_history.append((timestamp, raw_mass))
+            self.steady_history.append((timestamp, raw_mass))
+            return self.corrected_mass, self.evaporated_mass, self.stage, self.status_text
+
+        # Record reading in raw history
+        prev_reading = self.raw_history[-1] if self.raw_history else (timestamp, raw_mass)
+        self.raw_history.append((timestamp, raw_mass))
+        while self.raw_history and (timestamp - self.raw_history[0][0]) > 300.0:
+            self.raw_history.popleft()
+
+        # Find reference sample ~1.5s ago (prefer strictly prior samples)
+        target_t = timestamp - self.window_dt
+        prior_samples = [s for s in self.raw_history if s[0] < timestamp]
+        if prior_samples:
+            ref_sample = prior_samples[0]
+            min_diff = abs(ref_sample[0] - target_t)
+            for s in prior_samples:
+                diff = abs(s[0] - target_t)
+                if diff <= min_diff:
+                    min_diff = diff
+                    ref_sample = s
+        else:
+            ref_sample = self.raw_history[0]
+
+        dt_ref = timestamp - ref_sample[0]
+        if dt_ref >= 0.05:
+            dm_ref = raw_mass - ref_sample[1]
+            slope_ref = dm_ref / dt_ref
+        else:
+            dm_ref = 0.0
+            slope_ref = 0.0
+
+        # Change from immediate previous sample
+        dt_prev = timestamp - prev_reading[0]
+        dm_prev = raw_mass - prev_reading[1]
+        slope_prev = (dm_prev / dt_prev) if dt_prev > 0.01 else 0.0
+
+        baseline_slope = self.last_steady_slope if self._has_steady_baseline else 0.0
+
+        if self.state == StepDetectorState.STEADY:
+            is_step = False
+            # 1. Refill detection: Delta m > 5.0 g
+            if dm_ref > self.refill_threshold or dm_prev > self.refill_threshold:
+                is_step = True
+                self._enter_transient(
+                    ref_sample[0], ref_sample[1], "REFILL", target_stage=self.stage, current_t=timestamp
+                )
+            # 2. Upward step: Delta m_1.5s > +0.06 g AND Delta m / Delta t > +0.02 g/s
+            elif (
+                (dm_ref > self.step_threshold_up and slope_ref > self.slope_threshold_up)
+                or (dm_prev > self.step_threshold_up and slope_prev > self.slope_threshold_up)
+            ):
+                is_step = True
+                self._enter_transient(
+                    ref_sample[0], ref_sample[1], "UP", target_stage=self.stage + 1, current_t=timestamp
+                )
+            # 3. Downward throttling: excess slope over steady evaporation < -0.15 g/s AND Delta m < -0.15 g
+            elif (
+                ((slope_ref - baseline_slope) < self.excess_slope_down and dm_ref < self.step_threshold_down)
+                or ((slope_prev - baseline_slope) < self.excess_slope_down and dm_prev < self.step_threshold_down)
+            ):
+                is_step = True
+                self._enter_transient(
+                    ref_sample[0], ref_sample[1], "DOWN", target_stage=self.stage + 1, current_t=timestamp
+                )
+
+            if not is_step:
+                # Update steady history and baseline ONLY when strictly in steady state
+                self.steady_history.append((timestamp, raw_mass))
+                while self.steady_history and (timestamp - self.steady_history[0][0]) > 15.0:
+                    self.steady_history.popleft()
+                if len(self.steady_history) >= 3:
+                    res = calculate_linear_regression(list(self.steady_history))
+                    if res is not None:
+                        self.last_steady_slope = min(0.0, res[0])
+                        self._has_steady_baseline = True
+
+                self.corrected_mass = raw_mass - self.total_offset
+                self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+                self.status_text = "Stationär"
+
+        if self.state == StepDetectorState.TRANSIENT:
+            # Hold last steady rate during transient
+            dt_t = timestamp - self.transient_start_time
+            self.corrected_mass = self.transient_corr_start + self.last_steady_slope * dt_t
+            self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            self.status_text = "Stabilisierung..."
+
+            # Check for flattening / settling
+            flattened = False
+            if self.transient_type == "UP":
+                flattened = (slope_prev <= self.slope_threshold_up) or (dt_t >= 0.5 and abs(dm_prev) < 0.03)
+            elif self.transient_type == "DOWN":
+                flattened = ((slope_prev - self.last_steady_slope) >= self.excess_slope_down / 2.0) or (dt_t >= 0.5 and abs(dm_prev) < 0.03)
+            elif self.transient_type == "REFILL":
+                flattened = (slope_prev <= 0.1) or (dt_t >= 0.5 and abs(dm_prev) < 0.05)
+
+            if flattened or (dt_t >= 5.0):
+                self.state = StepDetectorState.SETTLING
+                self.settling_start_time = timestamp
+                self.settling_points = [(timestamp, raw_mass)]
+
+        elif self.state == StepDetectorState.SETTLING:
+            # Continue holding last rate while observing plateau
+            dt_t = timestamp - self.transient_start_time
+            self.corrected_mass = self.transient_corr_start + self.last_steady_slope * dt_t
+            self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            self.status_text = "Stabilisierung..."
+
+            self.settling_points.append((timestamp, raw_mass))
+            settling_dt = timestamp - self.settling_start_time
+
+            # If sudden large movement occurs during settling, re-enter transient
+            if abs(slope_prev - self.last_steady_slope) > 0.15 and abs(dm_prev) > 0.06:
+                self.state = StepDetectorState.TRANSIENT
+            # Check if settling complete
+            elif (settling_dt >= self.settling_duration and len(self.settling_points) >= self.settling_samples) or (settling_dt >= 3.0):
+                self._finish_settling(raw_mass, timestamp)
+
+        return self.corrected_mass, self.evaporated_mass, self.stage, self.status_text
+
+    def _enter_transient(self, ref_t: float, ref_m: float, t_type: str, target_stage: int, current_t: float):
+        start_t = ref_t
+        start_m = ref_m
+        # Find exact point where deviation began between ref and current
+        for s in self.raw_history:
+            if s[0] >= ref_t and s[0] < current_t:
+                m_model = ref_m + self.last_steady_slope * (s[0] - ref_t)
+                delta = s[1] - m_model
+                if t_type in ("UP", "REFILL") and delta > 0.02:
+                    break
+                elif t_type == "DOWN" and delta < -0.02:
+                    break
+                start_t = s[0]
+                start_m = s[1]
+
+        self.state = StepDetectorState.TRANSIENT
+        self.transient_start_time = start_t
+        self.transient_start_mass = start_m
+        self.transient_corr_start = start_m - self.total_offset
+        self.transient_type = t_type
+        self.transient_target_stage = target_stage
+        self.settling_start_time = None
+        self.settling_points.clear()
+        self.status_text = "Stabilisierung..."
+
+    def _finish_settling(self, current_raw: float, current_t: float):
+        if self.settling_points:
+            t_post = self.settling_points[-1][0]
+            t_mid = (self.settling_points[0][0] + self.settling_points[-1][0]) / 2.0
+            mean_m = sum(p[1] for p in self.settling_points) / len(self.settling_points)
+            m_post = mean_m + self.last_steady_slope * (t_post - t_mid)
+        else:
+            m_post = current_raw
+            t_post = current_t
+
+        dt_total = t_post - self.transient_start_time
+        m_expected = self.transient_start_mass + self.last_steady_slope * dt_total
+        delta_m_step = m_post - m_expected
+
+        if self.transient_type == "REFILL" or delta_m_step > self.refill_threshold:
+            # Refill: absorb offset, keep stage unchanged
+            self.total_offset += delta_m_step
+            self.corrected_mass = current_raw - self.total_offset
+            self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            self._splice_history(self.transient_start_time, t_post, self.transient_corr_start, self.corrected_mass)
+            self.state = StepDetectorState.STEADY
+            self.status_text = "Stationär"
+
+        elif abs(delta_m_step) < self.shock_threshold:
+            # Mechanical shock / bump: reject
+            self.corrected_mass = current_raw - self.total_offset
+            self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            self._splice_history(self.transient_start_time, t_post, self.transient_corr_start, self.corrected_mass)
+            self.state = StepDetectorState.STEADY
+            self.status_text = "Stationär"
+
+        else:
+            # Real step change (up or down)
+            self.total_offset += delta_m_step
+            self.stage = self.transient_target_stage if self.transient_target_stage is not None else (self.stage + 1)
+            self.corrected_mass = current_raw - self.total_offset
+            self.evaporated_mass = max(0.0, self.start_mass - self.corrected_mass)
+            self._splice_history(self.transient_start_time, t_post, self.transient_corr_start, self.corrected_mass)
+            self.state = StepDetectorState.STEADY
+            self.status_text = "Stationär"
+
+        self.transient_start_time = None
+        self.transient_start_mass = None
+        self.transient_corr_start = None
+        self.transient_type = None
+        self.transient_target_stage = None
+        self.settling_start_time = None
+        self.settling_points.clear()
+
+        # Re-initialize steady baseline on new plateau
+        self.steady_history.clear()
+        self.steady_history.append((current_t, current_raw))
+
+    def _splice_history(self, t0: float, t1: float, m0: float, m1: float):
+        self._spliced_history = [(t0, m0), (t1, m1)]
+
+
 class CalculationEngine:
     def __init__(self, max_history_seconds: float = 300.0):
         self.max_history_seconds = max_history_seconds
@@ -441,6 +799,29 @@ class CalculationEngine:
         self.channels: Dict[str, CalculationChannel] = {}
         # Stores the latest calculated results
         self.latest_results: Dict[str, CalculationResult] = {}
+        self.scale_roi_name: Optional[str] = None
+        self.step_detector = ScaleStepDetector()
+
+    def is_scale_roi(self, roi_name: str) -> bool:
+        if not roi_name:
+            return False
+        name_lower = roi_name.lower()
+        if name_lower in ("waage_korrigiert", "voc_verdampft", "stufe", "stufen_status"):
+            return False
+        if self.scale_roi_name is not None:
+            return name_lower == self.scale_roi_name.lower()
+        keywords = ("waage", "masse", "scale", "weight")
+        return any(k in name_lower for k in keywords)
+
+    def set_scale_roi(self, roi_name: Optional[str]):
+        self.scale_roi_name = roi_name
+
+    def reset_scale_detector(self, hard: bool = False):
+        """Resets the scale step detector and clears calculated virtual channel histories."""
+        self.step_detector.reset(hard=hard)
+        self.history.pop("Waage_korrigiert", None)
+        self.history.pop("VOC_verdampft", None)
+        self.history.pop("Stufe", None)
 
     def add_channel(self, channel: CalculationChannel):
         self.channels[channel.id] = channel
@@ -478,6 +859,59 @@ class CalculationEngine:
         min_ts = ts - self.max_history_seconds
         while q and q[0][0] < min_ts:
             q.popleft()
+
+        # If scale ROI, process with ScaleStepDetector and publish virtual channels
+        if self.is_scale_roi(roi_name):
+            if self.scale_roi_name is None:
+                self.scale_roi_name = roi_name
+            self._process_scale_reading(val_float, ts)
+
+    def _process_scale_reading(self, raw_mass: float, ts: float):
+        corr_m, evap_m, stage, status = self.step_detector.process_reading(raw_mass, ts)
+
+        # Update virtual channel history directly
+        for v_name, v_val in [
+            ("Waage_korrigiert", corr_m),
+            ("VOC_verdampft", evap_m),
+            ("Stufe", float(stage)),
+        ]:
+            if v_name not in self.history:
+                self.history[v_name] = deque()
+            vq = self.history[v_name]
+            vq.append((ts, v_val))
+            min_ts = ts - self.max_history_seconds
+            while vq and vq[0][0] < min_ts:
+                vq.popleft()
+
+        # Apply retroactive spliced points to Waage_korrigiert and VOC_verdampft history
+        spliced = self.step_detector.get_and_clear_spliced_history()
+        if spliced and len(spliced) >= 2:
+            t0, m0 = spliced[0]
+            t1, m1 = spliced[-1]
+            dt = t1 - t0
+
+            if "Waage_korrigiert" in self.history:
+                q_corr = self.history["Waage_korrigiert"]
+                new_q = deque()
+                for t_item, m_item in q_corr:
+                    if t0 <= t_item <= t1:
+                        spliced_val = m0 + (m1 - m0) * ((t_item - t0) / dt) if dt > 1e-6 else m0
+                        new_q.append((t_item, spliced_val))
+                    else:
+                        new_q.append((t_item, m_item))
+                self.history["Waage_korrigiert"] = new_q
+
+            if "VOC_verdampft" in self.history and self.step_detector.start_mass is not None:
+                sm = self.step_detector.start_mass
+                q_evap = self.history["VOC_verdampft"]
+                new_q_evap = deque()
+                for t_item, v_item in q_evap:
+                    if t0 <= t_item <= t1:
+                        spliced_val = m0 + (m1 - m0) * ((t_item - t0) / dt) if dt > 1e-6 else m0
+                        new_q_evap.append((t_item, max(0.0, sm - spliced_val)))
+                    else:
+                        new_q_evap.append((t_item, v_item))
+                self.history["VOC_verdampft"] = new_q_evap
 
     def update_readings(self, readings: List[Dict[str, Any]], timestamp: Optional[float] = None):
         """Bulk update history from readings list."""
@@ -593,6 +1027,18 @@ class CalculationEngine:
                     formatted_value="-",
                 )
 
+            if isinstance(res_val, str):
+                return CalculationResult(
+                    channel_id=channel.id,
+                    name=channel.name,
+                    value=None,
+                    unit=channel.unit,
+                    formula=channel.formula,
+                    is_valid=True,
+                    error_message=None,
+                    formatted_value=res_val,
+                )
+
             res_float = float(res_val)
             if math.isnan(res_float) or math.isinf(res_float):
                 return CalculationResult(
@@ -655,14 +1101,41 @@ class CalculationEngine:
 
     def calculate_all(
         self,
-        current_values: Optional[Dict[str, Optional[float]]] = None,
+        current_values: Optional[Dict[str, Any]] = None,
         current_time: Optional[float] = None,
     ) -> List[CalculationResult]:
         """
         Evaluates all channels in order. Supports channels depending on prior calculated channels.
         Iterates until convergence up to the number of channels to resolve any dependency chain depth.
         """
-        vals: Dict[str, Optional[float]] = dict(current_values) if current_values else {}
+        vals: Dict[str, Any] = dict(current_values) if current_values else {}
+
+        # If scale ROI is present in vals and needs processing, feed it
+        for k, v in vals.items():
+            if self.is_scale_roi(k) and v is not None:
+                try:
+                    val_f = float(v)
+                    if (
+                        self.step_detector._last_ts != current_time
+                        or self.step_detector._last_raw != val_f
+                    ):
+                        self.add_reading(k, val_f, current_time)
+                except (ValueError, TypeError):
+                    pass
+                break
+
+        # Publish virtual channels to current values
+        if self.step_detector.has_readings:
+            vals["Waage_korrigiert"] = self.step_detector.corrected_mass
+            vals["VOC_verdampft"] = self.step_detector.evaporated_mass
+            vals["Stufe"] = float(self.step_detector.stage)
+            vals["Stufen_Status"] = self.step_detector.status_text
+            if current_values is not None:
+                current_values["Waage_korrigiert"] = self.step_detector.corrected_mass
+                current_values["VOC_verdampft"] = self.step_detector.evaporated_mass
+                current_values["Stufe"] = float(self.step_detector.stage)
+                current_values["Stufen_Status"] = self.step_detector.status_text
+
         results: List[CalculationResult] = []
 
         max_passes = max(1, len(self.channels))

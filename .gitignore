@@ -12,3 +12,9 @@ wheels/
 # Logs and debug output
 *.log
 ocr_debug_log.txt
+
+# Video recordings
+recordings/
+*.mp4
+*.mkv
+

@@ -409,3 +409,180 @@ def test_main_window_invalid_ocr_not_in_calculations(tmp_path, qtbot):
     assert res is not None
     assert not res.is_valid
 
+
+def test_control_panel_stage_badge_and_reset(qtbot):
+    cp = ControlPanel()
+    qtbot.addWidget(cp)
+
+    # Initial state
+    assert cp.stage_badge.text() == "Stufe 1 (Stationär)"
+    assert "#2e7d32" in cp.stage_badge.styleSheet()
+
+    # Transition state
+    cp.set_stage_status(1, "Stabilisierung...", is_transition=True, target_stage=2)
+    assert cp.stage_badge.text() == "Stufenwechsel 1 → 2 (Stabilisierung...)"
+    assert "#ef6c00" in cp.stage_badge.styleSheet()
+
+    # Steady stage 2
+    cp.set_stage_status(2, "Stationär", is_transition=False)
+    assert cp.stage_badge.text() == "Stufe 2 (Stationär)"
+    assert "#2e7d32" in cp.stage_badge.styleSheet()
+
+    # Reset button click
+    reset_emitted = False
+
+    def on_reset():
+        nonlocal reset_emitted
+        reset_emitted = True
+
+    cp.stage_reset_requested.connect(on_reset)
+    cp.reset_stage_btn.click()
+    assert reset_emitted
+    assert cp.stage_badge.text() == "Stufe 1 (Stationär)"
+
+
+def test_main_window_step_detection_and_db_phase(tmp_path, qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    db_file = str(tmp_path / "step_phase_test.db")
+    window.db_writer.db.db_path = db_file
+    window.db_writer.db._init_db()
+
+    exp_id = window.db_writer.create_experiment("Exp", "VOC", "Desc")
+    run_id = window.db_writer.create_run(exp_id, 20.0, "Notes")
+
+    # Initial phase
+    assert window.db_writer.current_phase == "STAGE_1"
+    assert window.control_panel.stage_badge.text() == "Stufe 1 (Stationär)"
+
+    # Feed steady readings for 10s
+    for i in range(11):
+        t = float(i)
+        window.on_readings_ready([{
+            "roi_id": "r_w",
+            "roi_name": "Waage",
+            "raw_text": f"{500.0 - 0.01 * t:.2f}",
+            "parsed_value": 500.0 - 0.01 * t,
+            "unit": "g",
+            "is_valid": True,
+            "timestamp": t,
+        }], timestamp=t)
+
+    assert window.db_writer.current_phase == "STAGE_1"
+    assert window.control_panel.stage_badge.text() == "Stufe 1 (Stationär)"
+
+    # Upward jump at t=11
+    window.on_readings_ready([{
+        "roi_id": "r_w",
+        "roi_name": "Waage",
+        "raw_text": "500.39",
+        "parsed_value": 500.39,
+        "unit": "g",
+        "is_valid": True,
+        "timestamp": 11.0,
+    }], timestamp=11.0)
+
+    assert window.db_writer.current_phase == "STAGE_TRANSITION"
+    assert "Stufenwechsel" in window.control_panel.stage_badge.text()
+
+    # Settle at t=12 and t=13
+    window.on_readings_ready([{
+        "roi_id": "r_w",
+        "roi_name": "Waage",
+        "raw_text": "500.38",
+        "parsed_value": 500.38,
+        "unit": "g",
+        "is_valid": True,
+        "timestamp": 12.0,
+    }], timestamp=12.0)
+    window.on_readings_ready([{
+        "roi_id": "r_w",
+        "roi_name": "Waage",
+        "raw_text": "500.37",
+        "parsed_value": 500.37,
+        "unit": "g",
+        "is_valid": True,
+        "timestamp": 13.0,
+    }], timestamp=13.0)
+
+    # Now stage 2 steady
+    assert window.db_writer.current_phase == "STAGE_2"
+    assert window.control_panel.stage_badge.text() == "Stufe 2 (Stationär)"
+
+    # Verify database contents contain phase statuses and virtual channels
+    import sqlite3
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT phase_status FROM readings WHERE run_id = ?", (run_id,))
+        phases = {row[0] for row in cursor.fetchall()}
+        assert "STAGE_1" in phases
+        assert "STAGE_TRANSITION" in phases
+        assert "STAGE_2" in phases
+
+        cursor.execute("SELECT DISTINCT roi_name FROM readings WHERE run_id = ?", (run_id,))
+        logged_rois = {row[0] for row in cursor.fetchall()}
+        assert "Waage" in logged_rois
+
+    # Click reset stage button
+    window.control_panel.reset_stage_btn.click()
+    assert window.db_writer.current_phase == "STAGE_1"
+    assert window.control_panel.stage_badge.text() == "Stufe 1 (Stationär)"
+    assert window.calc_engine.step_detector.stage == 1
+
+
+def test_main_window_new_experiment_resets_detector(tmp_path, qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    db_file = str(tmp_path / "new_exp_test.db")
+    window.db_writer.db.db_path = db_file
+    window.db_writer.db._init_db()
+
+    # Move detector to stage 2
+    window.calc_engine.step_detector.stage = 2
+    window.calc_engine.step_detector.total_offset = 0.5
+    window.control_panel.set_stage_status(2, "Stationär")
+
+    # Start new experiment via create_experiment
+    from unittest.mock import patch
+    with patch("instrument_reader.gui.main_window.ExperimentDialog") as mock_dlg_cls:
+        mock_dlg = mock_dlg_cls.return_value
+        mock_dlg.exec.return_value = True
+        mock_dlg.get_data.return_value = {
+            "exp_name": "Exp2",
+            "voc_type": "Toluene",
+            "exp_desc": "Clean run",
+            "target_temp": 25.0,
+            "run_notes": "",
+        }
+        window.create_experiment()
+
+    # Must be reset to stage 1, tare offset 0, and phase STAGE_1
+    assert window.calc_engine.step_detector.stage == 1
+    assert window.calc_engine.step_detector.total_offset == 0.0
+    assert window.control_panel.stage_badge.text() == "Stufe 1 (Stationär)"
+    assert window.db_writer.current_phase == "STAGE_1"
+
+
+def test_main_window_virtual_channels_in_evaluation_and_dialog(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    # Feed a scale reading
+    window.on_readings_ready([{
+        "roi_id": "r_w",
+        "roi_name": "Waage",
+        "raw_text": "500.00",
+        "parsed_value": 500.00,
+        "unit": "g",
+        "is_valid": True,
+        "timestamp": 10.0,
+    }], timestamp=10.0)
+
+    vals = window._get_current_evaluation_values()
+    assert "Waage_korrigiert" in vals
+    assert "VOC_verdampft" in vals
+    assert "Stufe" in vals
+    assert vals["Waage_korrigiert"] == 500.00
+    assert vals["Stufe"] == 1.0
+
+
