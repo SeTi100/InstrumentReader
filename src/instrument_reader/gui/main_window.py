@@ -1,5 +1,6 @@
 import json
 import uuid
+from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
@@ -13,8 +14,9 @@ from instrument_reader.gui.video_widget import VideoWidget
 from instrument_reader.gui.control_panel import ControlPanel, CalculationChannelDialog
 from instrument_reader.gui.ocr_worker import OCRWorker
 from instrument_reader.gui.db_writer import DatabaseWriter
-from instrument_reader.gui.experiment_dialog import ExperimentDialog
+from instrument_reader.gui.experiment_dialog import ExperimentDialog, NewRunDialog
 from instrument_reader.gui.export_dialog import ExportDialog
+from instrument_reader.gui.runs_dashboard import RunsDashboardDialog
 from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
 
@@ -105,6 +107,9 @@ class MainWindow(QMainWindow):
         self.recorder = VideoRecorder(output_dir="recordings")
         self.db_writer.set_phase(f"STAGE_{self.calc_engine.step_detector.stage}")
         self._roi_counter = 1
+        self.current_experiment_id = None
+        self.current_experiment_name = ""
+        self.last_run_parameters = {}
         
         self.setup_ui()
         
@@ -190,6 +195,8 @@ class MainWindow(QMainWindow):
         
         self.control_panel.interval_spin.valueChanged.connect(self.ocr_worker.set_interval)
         self.control_panel.new_exp_btn.clicked.connect(self.create_experiment)
+        self.control_panel.new_run_btn.clicked.connect(self.create_new_run)
+        self.control_panel.dashboard_btn.clicked.connect(self.open_runs_dashboard)
         self.control_panel.delete_roi_btn.clicked.connect(self.delete_roi)
         
         self.ocr_worker.readings_ready.connect(self.on_readings_ready)
@@ -262,6 +269,10 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         quit_act = file_menu.addAction("Quit")
         quit_act.triggered.connect(self.close)
+
+        db_menu = menu.addMenu("Database")
+        dashboard_act = db_menu.addAction("Runs Dashboard...")
+        dashboard_act.triggered.connect(self.open_runs_dashboard)
         
     def set_draw_mode(self, mode):
         self.control_panel.rect_btn.setChecked(mode == ROIShape.RECTANGLE)
@@ -465,11 +476,101 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             data = dlg.get_data()
             exp_id = self.db_writer.create_experiment(data["exp_name"], data["voc_type"], data["exp_desc"])
-            run_id = self.db_writer.create_run(exp_id, data["target_temp"], data["run_notes"])
-            self.control_panel.exp_label.setText(f"Experiment: {exp_id} | Run: {run_id}")
+            params = data.get("parameters")
+            if not params and data.get("target_temp") is not None:
+                params = {"Temperatur": f"{data['target_temp']} °C"}
+            elif not params:
+                params = {}
+            self.last_run_parameters = dict(params)
+
+            run_id = self.db_writer.create_run(
+                exp_id,
+                target_temp=data.get("target_temp"),
+                notes=data.get("run_notes", ""),
+                parameters=params,
+            )
+            self.current_experiment_id = exp_id
+            self.current_experiment_name = data["exp_name"]
+            self.control_panel.exp_label.setText(f"Experiment: {data['exp_name']} (ID: {exp_id}) | Run: {run_id}")
             self.calc_engine.reset_scale_detector(hard=True)
             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
             self.db_writer.set_phase("STAGE_1")
+
+    def create_new_run(self):
+        if not self.current_experiment_id:
+            QMessageBox.information(
+                self,
+                "No Active Experiment",
+                "Please create an experiment first before starting a new run."
+            )
+            return
+
+        dlg = NewRunDialog(
+            exp_name=self.current_experiment_name,
+            exp_id=self.current_experiment_id,
+            initial_parameters=self.last_run_parameters,
+            parent=self,
+        )
+        if dlg.exec():
+            data = dlg.get_data()
+            params = data.get("parameters")
+            if not params and data.get("target_temp") is not None:
+                params = {"Temperatur": f"{data['target_temp']} °C"}
+            elif not params:
+                params = {}
+            self.last_run_parameters = dict(params)
+
+            run_id = self.db_writer.create_run(
+                self.current_experiment_id,
+                target_temp=data.get("target_temp"),
+                notes=data.get("run_notes", ""),
+                parameters=params,
+            )
+            self.control_panel.exp_label.setText(
+                f"Experiment: {self.current_experiment_name} (ID: {self.current_experiment_id}) | Run: {run_id}"
+            )
+            self.calc_engine.reset_scale_detector(hard=True)
+            self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+            self.db_writer.set_phase("STAGE_1")
+
+    def open_runs_dashboard(self):
+        dlg = RunsDashboardDialog(
+            self.db_writer.db,
+            current_run_id=self.db_writer.current_run_id,
+            parent=self,
+        )
+        dlg.active_run_changed.connect(self.set_active_run)
+        dlg.active_run_cleared.connect(self.clear_active_run)
+        dlg.exec()
+
+    def set_active_run(self, run_id: int, exp_id: int, exp_name: str, parameters: Optional[dict] = None):
+        self.db_writer.set_active_run(run_id)
+        self.current_experiment_id = exp_id
+        self.current_experiment_name = exp_name
+        if parameters is not None:
+            self.last_run_parameters = dict(parameters)
+        else:
+            try:
+                tree = self.db_writer.db.get_experiments_tree()
+                for exp in tree:
+                    for r in exp.get("runs", []):
+                        if r["id"] == run_id:
+                            self.last_run_parameters = dict(r.get("parameters", {}))
+                            break
+            except Exception:
+                pass
+        self.control_panel.exp_label.setText(f"Experiment: {exp_name} (ID: {exp_id}) | Run: {run_id}")
+        self.calc_engine.reset_scale_detector(hard=True)
+        self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
+        self.db_writer.set_phase("STAGE_1")
+
+    def clear_active_run(self):
+        self.db_writer.current_run_id = None
+        self.current_experiment_id = None
+        self.current_experiment_name = ""
+        self.last_run_parameters = {}
+        self.control_panel.exp_label.setText("Experiment: None | Run: None")
+        self.control_panel.set_stage_status(1, "Inaktiv", inactive=True)
             
     def on_readings_ready(self, readings, timestamp=None):
         self.control_panel.update_readings(readings)

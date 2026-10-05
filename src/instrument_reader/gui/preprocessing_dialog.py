@@ -766,7 +766,7 @@ class PreprocessingDialog(QDialog):
                             self.scene.addItem(c_line)
                             self.debug_overlay_items.append(c_line)
 
-                            txt = QGraphicsSimpleTextItem(f"★ Float y={cy:.0f} (g={g_val:+.1f})")
+                            txt = QGraphicsSimpleTextItem(f"Float y={cy:.0f} (g={g_val:+.1f})")
                             txt.setBrush(QColor(255, 50, 50))
                             txt.setFont(QFont("sans-serif", 8, QFont.Bold))
                             txt.setPos(label_x, cy - 7)

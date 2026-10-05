@@ -98,7 +98,7 @@ class VideoWidget(QLabel):
                     val_str = f" : {r['parsed_value']} {roi.unit}"
                 elif r and not r.get("is_valid", False):
                     val_str = f" [{r.get('reason', '...')}]"
-                display_text = f"📦 {roi.name}{val_str}"
+                display_text = f"{roi.name}{val_str}"
             elif is_child:
                 pen = QPen(QColor(255, 165, 0), 2, Qt.DashLine)  # Amber dashed for sub-ROIs
                 slot_idx = r.get("slot_index", "") if r else ""
@@ -224,7 +224,7 @@ class VideoWidget(QLabel):
                             val_str = f" : {r['parsed_value']} {roi.unit}"
                         elif r and not r.get("is_valid", False):
                             val_str = f" [{r.get('reason', '...')}]"
-                        display_text = f"📏 {roi.name}{val_str}"
+                        display_text = f"{roi.name}{val_str}"
                         painter.setPen(QPen(QColor(0, 220, 255), 2))
                         painter.drawText(wx1, max(14, wy1 - 10), display_text)
                 

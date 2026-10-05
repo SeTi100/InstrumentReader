@@ -7,8 +7,8 @@ from PySide6.QtWidgets import (
     QGroupBox, QLineEdit, QScrollArea, QDialog, QDialogButtonBox,
     QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame, QCheckBox
 )
-from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray
-from PySide6.QtGui import QDrag, QFont
+from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray, QRectF
+from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 
 from instrument_reader.core.calculation import (
     CalculationChannel,
@@ -569,6 +569,78 @@ class CalculationChannelDialog(QDialog):
         self.accept()
 
 
+class LEDIndicator(QWidget):
+    """
+    Clean circular 12x12px LED indicator widget.
+    Colors:
+      - Steady: #2e7d32 (Green)
+      - Transition: #ef6c00 (Orange)
+      - Inactive: #9e9e9e (Grey)
+    Minimalist: No text next to the LED circle; stage and status
+    are exclusively displayed via tooltip (setToolTip).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self._color = "#2e7d32"
+        self._stage = 1
+        self._status = "Stationär"
+        self._is_transition = False
+        self._target_stage = None
+        self._inactive = False
+        self._text = "Stufe 1 (Stationär)"
+        self.setToolTip(self._text)
+
+    def set_status(
+        self,
+        stage: int,
+        status: str = "Stationär",
+        is_transition: bool = False,
+        target_stage: Optional[int] = None,
+        inactive: bool = False,
+    ):
+        self._stage = stage
+        self._status = status
+        self._is_transition = is_transition
+        self._target_stage = target_stage
+        self._inactive = inactive
+
+        if inactive:
+            self._color = "#9e9e9e"
+            self._text = f"Inaktiv ({status})"
+        elif is_transition:
+            target = target_stage or (stage + 1)
+            self._color = "#ef6c00"
+            self._text = f"Stufenwechsel {stage} → {target} ({status})"
+        else:
+            self._color = "#2e7d32"
+            self._text = f"Stufe {stage} ({status})"
+
+        self.setToolTip(self._text)
+        self.update()
+
+    def text(self) -> str:
+        """Compatibility accessor returning tooltip status text."""
+        return self._text
+
+    def styleSheet(self) -> str:
+        """Compatibility accessor returning background color."""
+        return f"background-color: {self._color};"
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            rect = QRectF(2, 2, 12, 12)
+            color = QColor(self._color)
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(color.darker(130), 1))
+            painter.drawEllipse(rect)
+        finally:
+            painter.end()
+
+
 class ControlPanel(QWidget):
     calc_channel_added = Signal(object)
     calc_channel_updated = Signal(object)
@@ -672,22 +744,29 @@ class ControlPanel(QWidget):
         # Experiment Info
         exp_group = QGroupBox("Current Run")
         exp_layout = QVBoxLayout(exp_group)
-        self.exp_label = QLabel("Experiment: None | Run: None")
-        exp_layout.addWidget(self.exp_label)
-        self.new_exp_btn = QPushButton("New Experiment/Run")
-        exp_layout.addWidget(self.new_exp_btn)
 
-        stage_box = QHBoxLayout()
-        self.stage_badge = QLabel("Stufe 1 (Stationär)")
-        self.stage_badge.setAlignment(Qt.AlignCenter)
-        self.stage_badge.setStyleSheet(
-            "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
-        )
-        self.reset_stage_btn = QPushButton("Stufe zurücksetzen")
+        info_row = QHBoxLayout()
+        self.exp_label = QLabel("Experiment: None | Run: None")
+        info_row.addWidget(self.exp_label, stretch=1)
+
+        self.stage_led = LEDIndicator()
+        self.stage_badge = self.stage_led
+        info_row.addWidget(self.stage_led, alignment=Qt.AlignCenter)
+
+        self.reset_stage_btn = QPushButton("Reset Stage")
         self.reset_stage_btn.clicked.connect(self._on_reset_stage_clicked)
-        stage_box.addWidget(self.stage_badge, stretch=2)
-        stage_box.addWidget(self.reset_stage_btn, stretch=1)
-        exp_layout.addLayout(stage_box)
+        info_row.addWidget(self.reset_stage_btn)
+        exp_layout.addLayout(info_row)
+
+        btn_row = QHBoxLayout()
+        self.new_exp_btn = QPushButton("New Experiment")
+        self.new_run_btn = QPushButton("New Run")
+        self.dashboard_btn = QPushButton("Runs Dashboard")
+        btn_row.addWidget(self.new_exp_btn)
+        btn_row.addWidget(self.new_run_btn)
+        btn_row.addWidget(self.dashboard_btn)
+        exp_layout.addLayout(btn_row)
+
         layout.addWidget(exp_group)
 
         # Readings Table (Draggable)
@@ -804,18 +883,15 @@ class ControlPanel(QWidget):
         status: str = "Stationär",
         is_transition: bool = False,
         target_stage: Optional[int] = None,
+        inactive: bool = False,
     ):
-        if is_transition:
-            target = target_stage or (stage + 1)
-            self.stage_badge.setText(f"Stufenwechsel {stage} → {target} ({status})")
-            self.stage_badge.setStyleSheet(
-                "background-color: #ef6c00; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
-            )
-        else:
-            self.stage_badge.setText(f"Stufe {stage} ({status})")
-            self.stage_badge.setStyleSheet(
-                "background-color: #2e7d32; color: white; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 12px;"
-            )
+        self.stage_led.set_status(
+            stage=stage,
+            status=status,
+            is_transition=is_transition,
+            target_stage=target_stage,
+            inactive=inactive,
+        )
 
     def is_video_source(self) -> bool:
         s = self.camera_source.text().strip()

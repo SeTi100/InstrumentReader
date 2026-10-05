@@ -1,6 +1,9 @@
 import sqlite3
 import time
+import json
+import re
 from datetime import datetime
+from typing import Optional, Dict, Any
 from PySide6.QtCore import QObject, Signal, Slot
 from instrument_reader.core.database import Database
 
@@ -17,12 +20,75 @@ class DatabaseWriter(QObject):
             cursor.execute("INSERT INTO experiments (name, voc_type, description) VALUES (?, ?, ?)",
                            (name, voc_type, desc))
             return cursor.lastrowid
+
+    @staticmethod
+    def _extract_temp_from_params(params: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(params, dict):
+            return None
+        for k, v in params.items():
+            k_clean = str(k).strip().lower()
+            if k_clean in ("temperatur", "temperature", "target temp", "target_temp", "temp", "target temperature"):
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str):
+                    v_clean = v.replace(",", ".")
+                    m = re.search(r"[-+]?(?:\d+\.?\d*|\.\d+)", v_clean)
+                    if m:
+                        try:
+                            return float(m.group(0))
+                        except ValueError:
+                            pass
+        return None
             
-    def create_run(self, exp_id, target_temp, notes):
+    def create_run(
+        self,
+        exp_id: int,
+        notes: Any = "",
+        parameters: Optional[Dict[str, Any]] = None,
+        target_temp: Optional[float] = None,
+        **kwargs
+    ):
+        if self.current_run_id is not None:
+            self.end_run()
+
+        if "notes" in kwargs:
+            notes = kwargs["notes"]
+        if "parameters" in kwargs:
+            parameters = kwargs["parameters"]
+        if "target_temp" in kwargs:
+            target_temp = kwargs["target_temp"]
+
+        # Support legacy positional call: create_run(exp_id, target_temp, notes)
+        if isinstance(notes, (int, float)):
+            target_temp = float(notes)
+            notes = str(parameters) if (parameters is not None and not isinstance(parameters, dict)) else ""
+            parameters = kwargs.get("parameters")
+        elif isinstance(notes, dict) and parameters is None:
+            parameters = notes
+            notes = ""
+        elif isinstance(notes, str) and parameters is not None and not isinstance(parameters, dict):
+            # Check if notes was a numeric temperature string passed positionally
+            v_clean = str(notes).strip().replace(",", ".")
+            m = re.match(r"^[-+]?(?:\d+\.?\d*|\.\d+)$", v_clean)
+            if m:
+                target_temp = float(m.group(0))
+                notes = str(parameters)
+                parameters = kwargs.get("parameters")
+
+        if parameters is None:
+            parameters = {}
+        else:
+            if target_temp is None:
+                target_temp = self._extract_temp_from_params(parameters)
+
+        params_json = json.dumps(parameters, ensure_ascii=False)
+
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO runs (experiment_id, target_temperature, notes) VALUES (?, ?, ?)",
-                           (exp_id, target_temp, notes))
+            cursor.execute(
+                "INSERT INTO runs (experiment_id, target_temperature, notes, parameters_json) VALUES (?, ?, ?, ?)",
+                (exp_id, target_temp, notes, params_json)
+            )
             self.current_run_id = cursor.lastrowid
             return self.current_run_id
             
@@ -32,6 +98,9 @@ class DatabaseWriter(QObject):
                 conn.execute("UPDATE runs SET ended_at = ? WHERE id = ?",
                              (datetime.now().isoformat(), self.current_run_id))
             self.current_run_id = None
+
+    def set_active_run(self, run_id: int):
+        self.current_run_id = run_id
             
     def set_phase(self, phase):
         self.current_phase = phase
