@@ -1,8 +1,10 @@
 """Enumerates the cameras attached to this machine without opening them.
 
 Opening a device just to probe it can disturb an application that is already using it
-(e.g. OBS), so names come from the OS: sysfs on Linux, Qt Multimedia elsewhere. The
-index of each entry is the index OpenCV uses for ``cv2.VideoCapture(index)``.
+(e.g. OBS), so names come from the OS: Media Foundation and DirectShow on Windows (via
+cv2_enumerate_cameras), sysfs on Linux, Qt Multimedia as fallback. The index of each
+entry is the source OpenCVCamera takes; indices of 100 and up carry OpenCV's backend
+offset (701 = DirectShow device 1).
 """
 import re
 import sys
@@ -64,11 +66,30 @@ def _from_qt() -> list[CameraDevice]:
     ]
 
 
+def _from_windows() -> list[CameraDevice]:
+    """Media Foundation cameras by plain index, plus DirectShow-only ones (virtual
+    cameras such as the OBS Virtual Camera) by OpenCV's encoded index, e.g. 701."""
+    import cv2
+    from cv2_enumerate_cameras import enumerate_cameras
+
+    msmf = enumerate_cameras(cv2.CAP_MSMF)
+    devices = [CameraDevice(c.index, c.name or f"Kamera {c.index}") for c in msmf]
+    known = {c.name for c in msmf}
+    devices += [
+        CameraDevice(cv2.CAP_DSHOW + c.index, c.name or f"DirectShow-Kamera {c.index}")
+        for c in enumerate_cameras(cv2.CAP_DSHOW)
+        if c.name not in known
+    ]
+    return devices
+
+
 def list_cameras() -> list[CameraDevice] | None:
     """Returns the cameras currently attached ([] if none), or None if they cannot be listed."""
     sources = [_from_qt]
     if sys.platform.startswith("linux"):
         sources.insert(0, _from_v4l2_sysfs)
+    elif sys.platform.startswith("win"):
+        sources.insert(0, _from_windows)
     result = None
     for source in sources:
         try:

@@ -257,3 +257,53 @@ def test_control_panel_camera_dropdown(qtbot, monkeypatch):
     assert panel.is_video_source() is True
     panel.refresh_cameras()
     assert panel.camera_source.text() == "run.mp4"
+
+
+def test_windows_list_includes_directshow_only_cameras(monkeypatch):
+    import sys
+    import types
+
+    import cv2
+    from instrument_reader.core import camera_devices
+
+    class Info:
+        def __init__(self, index, name):
+            self.index, self.name = index, name
+
+    lists = {
+        cv2.CAP_MSMF: [Info(0, "PC-LM1E Camera")],
+        cv2.CAP_DSHOW: [Info(0, "PC-LM1E Camera"), Info(1, "OBS Virtual Camera")],
+    }
+    fake = types.ModuleType("cv2_enumerate_cameras")
+    fake.enumerate_cameras = lambda api: lists[api]
+    monkeypatch.setitem(sys.modules, "cv2_enumerate_cameras", fake)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    devices = camera_devices.list_cameras()
+    assert [d.label for d in devices] == ["0: PC-LM1E Camera", "701: OBS Virtual Camera"]
+    assert parse_source(devices[1].label) == 701
+
+
+def test_encoded_index_opens_directshow_device(monkeypatch):
+    import cv2
+    from instrument_reader.core import camera as camera_mod
+
+    opened = []
+
+    class FakeCap:
+        def __init__(self, *args):
+            opened.append(args)
+
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(camera_mod.cv2, "VideoCapture", FakeCap)
+    monkeypatch.setattr("sys.platform", "win32")
+    cam = camera_mod.OpenCVCamera(701)
+    assert cam.open() is False
+    assert cam.clone().open() is False
+    assert opened == [(1, cv2.CAP_DSHOW), (1, cv2.CAP_DSHOW)]
+    assert cam.is_video_file is False
