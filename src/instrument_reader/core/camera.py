@@ -1,3 +1,5 @@
+import sys
+
 import cv2
 import numpy as np
 from abc import ABC, abstractmethod
@@ -41,19 +43,72 @@ class CameraSource(ABC):
         return 0.0
 
 
+def _backend_id(name: str) -> int | None:
+    for api in cv2.videoio_registry.getBackends():
+        if cv2.videoio_registry.getBackendName(api) == name:
+            return int(api)
+    return None
+
+
+def _is_plain_index(source) -> bool:
+    """True for a bare camera index; False for paths and backend-encoded indices like 701."""
+    return isinstance(source, int) and 0 <= source < 100
+
+
 class OpenCVCamera(CameraSource):
-    def __init__(self, source: int | str = 0):
+    def __init__(self, source: int | str = 0, api_preference: int | None = None):
         self._source = source
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
+        if api_preference is None and _is_plain_index(source) and sys.platform.startswith("win"):
+            # Media Foundation is what OpenCV picks first on Windows and what the camera
+            # list is read from. Pinning it stops OpenCV from silently falling back to
+            # DirectShow, whose index 0 may be a virtual camera (e.g. OBS) while the
+            # real camera is unplugged.
+            api_preference = cv2.CAP_MSMF
+        self._api = api_preference
+
+    @property
+    def source(self) -> int | str:
+        return self._source
+
+    def set_source(self, source: int | str) -> None:
+        """Points the camera at another device; takes effect on the next open()."""
+        self._source = source
+
+    def adopt(self, other: "OpenCVCamera") -> None:
+        """Takes over the backend and frame rate a reconnected clone ended up with."""
+        self._api = other._api
+        self._cached_fps = other.fps
+
+    def clone(self) -> "OpenCVCamera":
+        """Returns an unopened camera for the same device and backend (used for reconnects)."""
+        return type(self)(self._source, self._api)
 
     def open(self) -> bool:
-        self._cap = cv2.VideoCapture(self._source)
-        if self._cap.isOpened():
-            val = self._cap.get(cv2.CAP_PROP_FPS)
-            self._cached_fps = float(val) if val and val > 0 else 30.0
-            return True
-        return False
+        # Never leave a stale handle behind: a capture that is not released keeps
+        # the device locked for other applications (e.g. OBS) until the process exits.
+        self.release()
+        if isinstance(self._source, int) and not _is_plain_index(self._source):
+            # OpenCV's encoded form: 701 = device 1 of backend 700 (DirectShow).
+            cap = cv2.VideoCapture(self._source % 100, self._source - self._source % 100)
+        elif self._api is None:
+            cap = cv2.VideoCapture(self._source)
+        else:
+            cap = cv2.VideoCapture(self._source, self._api)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        if self._api is None and _is_plain_index(self._source):
+            # Reconnects must use the same backend, or a different device list applies.
+            try:
+                self._api = _backend_id(cap.getBackendName())
+            except cv2.error:
+                pass
+        self._cap = cap
+        val = cap.get(cv2.CAP_PROP_FPS)
+        self._cached_fps = float(val) if val and val > 0 else 30.0
+        return True
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
@@ -61,9 +116,9 @@ class OpenCVCamera(CameraSource):
         return self._cap.read()
 
     def release(self) -> None:
-        if self._cap:
-            self._cap.release()
-            self._cap = None
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            cap.release()
         self._cached_fps = None
 
     @property

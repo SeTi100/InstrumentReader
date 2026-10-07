@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray, QRectF
 from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 
+from instrument_reader.core.camera_devices import label_name, list_cameras, parse_source
 from instrument_reader.core.calculation import (
     CalculationChannel,
     CalculationResult,
@@ -646,6 +647,8 @@ class ControlPanel(QWidget):
     calc_channel_updated = Signal(object)
     calc_channel_deleted = Signal(str)
     stage_reset_requested = Signal()
+    # Emitted after every camera list refresh: list[CameraDevice], or None if unknown.
+    cameras_changed = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -662,11 +665,36 @@ class ControlPanel(QWidget):
         cam_group = QGroupBox("Camera")
         cam_layout = QVBoxLayout(cam_group)
 
-        self.camera_source = QLineEdit("0")
+        # Editable dropdown: pick a detected camera or type an index, video file or stream URL.
+        # camera_source is the dropdown's text field, so text()/setText() keep working.
+        self.camera_combo = QComboBox()
+        self.camera_combo.setEditable(True)
+        self.camera_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.camera_combo.setToolTip("Kamera auswählen oder Index / Videodatei / Stream-URL eintragen")
+        self.camera_source = self.camera_combo.lineEdit()
+        self.camera_refresh_btn = QPushButton("↻")
+        self.camera_refresh_btn.setFixedWidth(28)
+        self.camera_refresh_btn.setToolTip("Kameraliste aktualisieren")
+        self.camera_refresh_btn.clicked.connect(self.refresh_cameras)
         source_layout = QHBoxLayout()
         source_layout.addWidget(QLabel("Source:"))
-        source_layout.addWidget(self.camera_source)
+        source_layout.addWidget(self.camera_combo, 1)
+        source_layout.addWidget(self.camera_refresh_btn)
         cam_layout.addLayout(source_layout)
+
+        self.camera_status = QLabel("")
+        self.camera_status.setWordWrap(True)
+        self.camera_status.setVisible(False)
+        cam_layout.addWidget(self.camera_status)
+
+        self.refresh_cameras()
+        self._media_devices = None
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            self._media_devices = QMediaDevices(self)
+            self._media_devices.videoInputsChanged.connect(self.refresh_cameras)
+        except Exception:
+            pass
 
         # Neutral grey button style
         self.NEUTRAL_BTN_STYLE = (
@@ -893,9 +921,56 @@ class ControlPanel(QWidget):
             inactive=inactive,
         )
 
+    def selected_source(self) -> int | str:
+        """The selected source as OpenCV expects it: a camera index or a path/URL."""
+        return parse_source(self.camera_source.text())
+
     def is_video_source(self) -> bool:
-        s = self.camera_source.text().strip()
-        return not s.isdigit() and len(s) > 0 and not s.startswith("/dev/video")
+        src = self.selected_source()
+        return isinstance(src, str) and len(src) > 0 and not src.startswith("/dev/video")
+
+    def refresh_cameras(self):
+        """Re-reads the attached cameras into the dropdown, keeping the selected camera.
+
+        The selection follows the camera's name, so it stays correct when the OS
+        renumbers devices after a camera is unplugged and plugged back in.
+        """
+        current = self.camera_source.text().strip()
+        current_src = parse_source(current)
+        current_name = label_name(current)
+        found = list_cameras()
+        devices = found or []
+
+        labels = [dev.label for dev in devices]
+        existing = [self.camera_combo.itemText(i) for i in range(self.camera_combo.count())]
+        if labels != existing or not current:
+            self.camera_combo.blockSignals(True)
+            self.camera_combo.clear()
+            for dev in devices:
+                self.camera_combo.addItem(dev.label, dev.index)
+            self.camera_combo.blockSignals(False)
+
+            match = -1
+            if current_name is not None:
+                match = next((i for i, dev in enumerate(devices) if dev.name == current_name), -1)
+            if match < 0 and current_name is None:
+                match = next((i for i, dev in enumerate(devices) if dev.index == current_src), -1)
+            if match >= 0:
+                self.camera_combo.setCurrentIndex(match)
+            elif current:
+                self.camera_combo.setEditText(current)
+            elif devices:
+                self.camera_combo.setCurrentIndex(0)
+            else:
+                self.camera_combo.setEditText("0")
+
+        self.cameras_changed.emit(found)
+
+    def set_camera_status(self, state: str, message: str):
+        colors = {"connected": "#2e7d32", "connecting": "#b26a00", "reconnecting": "#c62828"}
+        self.camera_status.setText(message)
+        self.camera_status.setStyleSheet(f"color: {colors.get(state, '#606060')};")
+        self.camera_status.setVisible(bool(message))
 
     def update_playback_state(self):
         is_video = self.is_video_source()

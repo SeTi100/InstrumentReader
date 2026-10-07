@@ -9,6 +9,7 @@ dependencies = [
     "pytesseract>=0.3.10",
     "numpy>=1.26",
     "pyqtgraph>=0.13",
+    "cv2-enumerate-cameras>=1.4; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
