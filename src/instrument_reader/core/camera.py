@@ -47,13 +47,26 @@ class OpenCVCamera(CameraSource):
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
 
+    @property
+    def source(self) -> int | str:
+        return self._source
+
+    def clone(self) -> "OpenCVCamera":
+        """Returns an unopened camera for the same source (used for reconnects)."""
+        return type(self)(self._source)
+
     def open(self) -> bool:
-        self._cap = cv2.VideoCapture(self._source)
-        if self._cap.isOpened():
-            val = self._cap.get(cv2.CAP_PROP_FPS)
-            self._cached_fps = float(val) if val and val > 0 else 30.0
-            return True
-        return False
+        # Never leave a stale handle behind: a capture that is not released keeps
+        # the device locked for other applications (e.g. OBS) until the process exits.
+        self.release()
+        cap = cv2.VideoCapture(self._source)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        self._cap = cap
+        val = cap.get(cv2.CAP_PROP_FPS)
+        self._cached_fps = float(val) if val and val > 0 else 30.0
+        return True
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
@@ -61,9 +74,9 @@ class OpenCVCamera(CameraSource):
         return self._cap.read()
 
     def release(self) -> None:
-        if self._cap:
-            self._cap.release()
-            self._cap = None
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            cap.release()
         self._cached_fps = None
 
     @property
