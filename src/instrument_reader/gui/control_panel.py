@@ -7,10 +7,12 @@ from PySide6.QtWidgets import (
     QGroupBox, QLineEdit, QScrollArea, QDialog, QDialogButtonBox,
     QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame, QCheckBox
 )
-from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray, QRectF
+from PySide6.QtCore import Qt, QTimer, Signal, QMimeData, QByteArray, QRectF
 from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 
-from instrument_reader.core.camera_devices import label_name, list_cameras, parse_source
+from instrument_reader.core.camera_devices import (
+    label_name, list_cameras, parse_source, windows_listing_incomplete,
+)
 from instrument_reader.core.calculation import (
     CalculationChannel,
     CalculationResult,
@@ -642,6 +644,16 @@ class LEDIndicator(QWidget):
             painter.end()
 
 
+class _CameraCombo(QComboBox):
+    """Editable dropdown that re-scans the cameras each time it is opened."""
+
+    about_to_show = Signal()
+
+    def showPopup(self):
+        self.about_to_show.emit()
+        super().showPopup()
+
+
 class ControlPanel(QWidget):
     calc_channel_added = Signal(object)
     calc_channel_updated = Signal(object)
@@ -670,7 +682,7 @@ class ControlPanel(QWidget):
 
         # Editable dropdown: pick a detected camera or type an index, video file or stream URL.
         # camera_source is the dropdown's text field, so text()/setText() keep working.
-        self.camera_combo = QComboBox()
+        self.camera_combo = _CameraCombo()
         self.camera_combo.setEditable(True)
         self.camera_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.camera_combo.setToolTip("Kamera auswählen oder Index / Videodatei / Stream-URL eintragen")
@@ -690,7 +702,24 @@ class ControlPanel(QWidget):
         self.camera_status.setVisible(False)
         cam_layout.addWidget(self.camera_status)
 
+        self.camera_hint = QLabel(
+            "DirectShow-Kameras (z. B. virtuelle Kameras) können nicht aufgelistet werden: "
+            "Paket „cv2-enumerate-cameras“ fehlt (uv sync / pip install -e .). "
+            "Index eintippen funktioniert trotzdem."
+        )
+        self.camera_hint.setWordWrap(True)
+        self.camera_hint.setStyleSheet("color: #b26a00;")
+        self.camera_hint.setVisible(windows_listing_incomplete())
+        cam_layout.addWidget(self.camera_hint)
+
+        self._cameras_initialized = False
         self.refresh_cameras()
+        self.camera_combo.about_to_show.connect(self.refresh_cameras)
+        # Virtual cameras (DirectShow) send no hot-plug notification, so re-scan regularly.
+        self._camera_scan_timer = QTimer(self)
+        self._camera_scan_timer.setInterval(3000)
+        self._camera_scan_timer.timeout.connect(self.refresh_cameras)
+        self._camera_scan_timer.start()
         self._media_devices = None
         try:
             from PySide6.QtMultimedia import QMediaDevices
@@ -956,7 +985,9 @@ class ControlPanel(QWidget):
 
         labels = [dev.label for dev in devices]
         existing = [self.camera_combo.itemText(i) for i in range(self.camera_combo.count())]
-        if labels != existing or not current:
+        first = not self._cameras_initialized
+        self._cameras_initialized = True
+        if labels != existing or first:
             self.camera_combo.blockSignals(True)
             self.camera_combo.clear()
             for dev in devices:
@@ -970,7 +1001,8 @@ class ControlPanel(QWidget):
                 match = next((i for i, dev in enumerate(devices) if dev.index == current_src), -1)
             if match >= 0:
                 self.camera_combo.setCurrentIndex(match)
-            elif current:
+            elif current or not first:
+                # Never overwrite what the user typed (or cleared) themselves.
                 self.camera_combo.setEditText(current)
             elif devices:
                 self.camera_combo.setCurrentIndex(0)

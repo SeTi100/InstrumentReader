@@ -194,13 +194,39 @@ def test_main_window_follows_camera_by_name(qtbot, monkeypatch):
 
 def test_reconnect_keeps_backend(monkeypatch):
     import cv2
+    from instrument_reader.core import camera as camera_mod
     from instrument_reader.core.camera import OpenCVCamera
 
     assert OpenCVCamera(0, cv2.CAP_V4L2).clone()._api == cv2.CAP_V4L2
+
+    # A typed index lets OpenCV pick any backend (so DirectShow-only virtual cameras
+    # work), then sticks to the backend that opened it for every reconnect.
+    opened = []
+
+    class FakeCap:
+        def __init__(self, *args):
+            opened.append(args)
+
+        def isOpened(self):
+            return True
+
+        def getBackendName(self):
+            return "V4L2"
+
+        def get(self, prop):
+            return 30.0
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(camera_mod.cv2, "VideoCapture", FakeCap)
     monkeypatch.setattr("sys.platform", "win32")
-    # On Windows a camera index never falls back to DirectShow (virtual cameras live there).
-    assert OpenCVCamera(0)._api == cv2.CAP_MSMF
-    assert OpenCVCamera("video.mp4")._api is None
+    cam = OpenCVCamera(1)
+    assert cam._api is None
+    assert cam.open() is True
+    clone = cam.clone()
+    assert clone.open() is True
+    assert opened == [(1,), (1, cv2.CAP_V4L2)]
 
 
 def test_dropdown_follows_camera_name_when_renumbered(qtbot, monkeypatch):
@@ -307,3 +333,33 @@ def test_encoded_index_opens_directshow_device(monkeypatch):
     assert cam.clone().open() is False
     assert opened == [(1, cv2.CAP_DSHOW), (1, cv2.CAP_DSHOW)]
     assert cam.is_video_file is False
+
+
+def test_typed_source_survives_rescans(qtbot, monkeypatch):
+    devices = [CameraDevice(0, "PC-LM1E Camera")]
+    monkeypatch.setattr("instrument_reader.gui.control_panel.list_cameras", lambda: list(devices))
+    panel = ControlPanel()
+    qtbot.addWidget(panel)
+
+    panel.camera_source.setText("")
+    devices.append(CameraDevice(701, "Simulator Cam"))
+    panel.refresh_cameras()
+    assert panel.camera_source.text() == ""  # a cleared field stays cleared
+
+    panel.camera_source.setText("C:/runs/test.mp4")
+    devices.pop()
+    panel.refresh_cameras()
+    assert panel.camera_source.text() == "C:/runs/test.mp4"
+
+
+def test_opening_dropdown_rescans(qtbot, monkeypatch):
+    devices = [CameraDevice(0, "PC-LM1E Camera")]
+    monkeypatch.setattr("instrument_reader.gui.control_panel.list_cameras", lambda: list(devices))
+    panel = ControlPanel()
+    qtbot.addWidget(panel)
+
+    devices.append(CameraDevice(701, "Simulator Cam"))
+    panel.camera_combo.about_to_show.emit()
+    assert [panel.camera_combo.itemText(i) for i in range(panel.camera_combo.count())] == [
+        "0: PC-LM1E Camera", "701: Simulator Cam",
+    ]
