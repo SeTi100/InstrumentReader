@@ -145,7 +145,8 @@ def test_opencv_camera_video_file_detection_and_seeking(tmp_path):
 # ControlPanel Playback Controls Tests
 # ---------------------------------------------------------------------------
 
-def test_control_panel_playback_controls_state(qtbot):
+def test_control_panel_playback_controls_state(qtbot, monkeypatch):
+    monkeypatch.setattr("instrument_reader.gui.control_panel.list_cameras", lambda: [])
     panel = ControlPanel()
     qtbot.addWidget(panel)
 

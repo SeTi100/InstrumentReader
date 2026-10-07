@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal, QMutex
+from PySide6.QtCore import Qt, QTimer
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -19,81 +19,8 @@ from instrument_reader.gui.export_dialog import ExportDialog
 from instrument_reader.gui.runs_dashboard import RunsDashboardDialog
 from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
-
-class CameraThread(QThread):
-    frame_ready = Signal(object)
-
-    def __init__(self, camera):
-        super().__init__()
-        self.camera = camera
-        self.running = False
-        self.paused = False
-        self._lock = QMutex()
-
-    def run(self):
-        self.running = True
-        self.paused = False
-        if not getattr(self.camera, "is_opened", False) and not self.camera.open():
-            self.running = False
-            return
-
-        while self.running:
-            if self.paused:
-                self.msleep(50)
-                continue
-
-            self._lock.lock()
-            ret, frame = self.camera.read()
-            self._lock.unlock()
-
-            if ret and frame is not None:
-                self.frame_ready.emit(frame)
-            else:
-                if getattr(self.camera, "is_video_file", False):
-                    self.paused = True
-
-            fps = self.camera.fps
-            interval = int(1000 / fps) if fps > 0 else 33
-            self.msleep(interval)
-
-    def pause(self):
-        self.paused = True
-
-    def resume(self):
-        self.paused = False
-
-    def seek(self, seconds: float):
-        self._lock.lock()
-        try:
-            if self.camera:
-                self.camera.seek(seconds)
-                if self.paused:
-                    ret, frame = self.camera.read()
-                    if ret and frame is not None:
-                        self.frame_ready.emit(frame)
-        finally:
-            self._lock.unlock()
-
-    def seek_to_frame(self, frame_num: int):
-        self._lock.lock()
-        try:
-            if self.camera:
-                self.camera.seek_to_frame(frame_num)
-                if self.paused:
-                    ret, frame = self.camera.read()
-                    if ret and frame is not None:
-                        self.frame_ready.emit(frame)
-        finally:
-            self._lock.unlock()
-
-    def stop(self):
-        self.running = False
-        self.wait()
-        self._lock.lock()
-        try:
-            self.camera.release()
-        finally:
-            self._lock.unlock()
+from instrument_reader.gui.camera_thread import CameraThread
+from instrument_reader.core.camera_devices import label_name, parse_source
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -115,6 +42,12 @@ class MainWindow(QMainWindow):
         
         self.camera = None
         self.camera_thread = None
+        # Name of the live camera in use, so a reconnect finds it again even if the
+        # OS renumbers devices (and never silently switches to another camera).
+        self._camera_name = None
+        self._device_watch = QTimer(self)
+        self._device_watch.setInterval(500)
+        self._device_watch.timeout.connect(self.control_panel.refresh_cameras)
         
         self.setup_connections()
         self.setup_menus()
@@ -136,8 +69,7 @@ class MainWindow(QMainWindow):
         
     def setup_connections(self):
         def start_camera():
-            src_str = self.control_panel.camera_source.text().strip()
-            src = int(src_str) if src_str.isdigit() else src_str
+            src = self.control_panel.selected_source()
 
             if self.camera_thread and self.camera_thread.running:
                 if self.camera and getattr(self.camera, "_source", None) == src:
@@ -162,8 +94,20 @@ class MainWindow(QMainWindow):
             self.camera = OpenCVCamera(src)
             self.camera_thread = CameraThread(self.camera)
             self.camera_thread.frame_ready.connect(self.video_widget.update_frame)
-            self.camera_thread.frame_ready.connect(self.ocr_worker.update_frame)
+            # Direct connection: OCRWorker.update_frame is mutex-protected and must see
+            # every frame (with its timestamp) even when the GUI thread is busy.
+            self.camera_thread.frame_captured.connect(self.ocr_worker.update_frame, Qt.DirectConnection)
+            self.camera_thread.backpressure = self.ocr_worker.wait_while_pending
+            self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
             self.camera_thread.frame_ready.connect(self.recorder.write_frame)
+            self.camera_thread.status_changed.connect(self.on_camera_status)
+            self._camera_name = None
+            if isinstance(src, int):
+                combo = self.control_panel.camera_combo
+                labels = [self.control_panel.camera_source.text()]
+                labels += [combo.itemText(i) for i in range(combo.count()) if parse_source(combo.itemText(i)) == src]
+                self._camera_name = next((n for n in map(label_name, labels) if n), None)
+                self._device_watch.start()
             self.camera_thread.start()
             self.ocr_worker.start()
 
@@ -173,14 +117,17 @@ class MainWindow(QMainWindow):
                     if not self.camera_thread.paused:
                         self.camera_thread.pause()
                         return
+                self._device_watch.stop()
                 self.camera_thread.stop()
                 self.camera_thread = None
                 self.camera = None
+                self.control_panel.set_camera_status("stopped", "")
             self.ocr_worker.stop()
             if self.recorder.is_recording:
                 self.recorder.stop_recording()
                 self.control_panel.set_recording(False)
 
+        self.control_panel.cameras_changed.connect(self.on_cameras_changed)
         self.control_panel.start_btn.clicked.connect(start_camera)
         self.control_panel.stop_btn.clicked.connect(stop_camera)
         self.control_panel.fwd_btn.clicked.connect(lambda: self.seek_video(5.0))
@@ -194,6 +141,7 @@ class MainWindow(QMainWindow):
         self.control_panel.ruler_btn.clicked.connect(lambda: self.set_draw_mode(ROIShape.RULER))
         
         self.control_panel.interval_spin.valueChanged.connect(self.ocr_worker.set_interval)
+        self.control_panel.speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
         self.control_panel.new_exp_btn.clicked.connect(self.create_experiment)
         self.control_panel.new_run_btn.clicked.connect(self.create_new_run)
         self.control_panel.dashboard_btn.clicked.connect(self.open_runs_dashboard)
@@ -216,6 +164,10 @@ class MainWindow(QMainWindow):
         self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
         self.db_writer.set_phase("STAGE_1")
 
+    def _on_playback_speed_changed(self, _index=None):
+        if self.camera_thread:
+            self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
+
     def seek_video(self, seconds: float):
         # Clear calculation engine history buffer and reset scale step detector
         self.calc_engine.history.clear()
@@ -227,7 +179,7 @@ class MainWindow(QMainWindow):
             self.camera_thread.seek(seconds)
         else:
             src_str = self.control_panel.camera_source.text().strip()
-            if src_str and not src_str.isdigit():
+            if src_str and self.control_panel.is_video_source():
                 if self.camera is None or not getattr(self.camera, "is_opened", False):
                     if self.camera:
                         self.camera.release()
@@ -238,6 +190,24 @@ class MainWindow(QMainWindow):
                 ret, frame = self.camera.read()
                 if ret and frame is not None:
                     self.video_widget.update_frame(frame)
+
+    def on_cameras_changed(self, devices):
+        """Keeps the live camera thread pointed at the selected camera's current index."""
+        thread = self.camera_thread
+        if thread is None or not thread.running or self._camera_name is None or devices is None:
+            return
+        matches = [d.index for d in devices if d.name == self._camera_name]
+        if not matches:
+            thread.set_device(None)
+        else:
+            current = getattr(self.camera, "source", None)
+            thread.set_device(current if current in matches else matches[0])
+
+    def on_camera_status(self, state: str, message: str):
+        self.control_panel.set_camera_status(state, message)
+        if state in ("connecting", "reconnecting"):
+            # Without a live picture the OCR must not keep logging the last frame as current.
+            self.ocr_worker.update_frame(None)
 
     def toggle_recording(self):
         if not self.recorder.is_recording:
@@ -631,7 +601,7 @@ class MainWindow(QMainWindow):
                 "is_calculated": 1,
             })
 
-        self.db_writer.insert_readings(all_readings)
+        self.db_writer.insert_readings(all_readings, timestamp=ts)
 
     def _get_current_evaluation_values(self):
         current_vals = {
