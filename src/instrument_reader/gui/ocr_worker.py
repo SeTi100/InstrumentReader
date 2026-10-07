@@ -98,6 +98,12 @@ class OCRWorker(QThread):
         with QMutexLocker(self.mutex):
             self.interval_ms = interval_ms
             
+    def _recognize_many(self, images: List[np.ndarray], config: Optional[str]) -> List[OCRResult]:
+        recognize_many = getattr(self.engine, "recognize_many", None)
+        if recognize_many is not None:
+            return recognize_many(images, config)
+        return [self.engine.recognize(img, config=config) for img in images]
+
     def resolve_hierarchy(self, rois: List[ROIConfig]) -> Tuple[Dict[str, List[ROIConfig]], Set[str]]:
         """
         Determines which ROIs are containers and maps each container to its children.
@@ -338,9 +344,9 @@ class OCRWorker(QThread):
                     allow_neg = getattr(container, "allow_negative", True)
                     whitelist = "0123456789-" if allow_neg else "0123456789"
                     
-                    # Process each child digit slot
+                    # Preprocess all child digit slots first, then OCR them together
+                    slots = []
                     for idx, child in enumerate(children_sorted):
-                        child_key = getattr(child, "id", child.name)
                         child_crop = extract_roi_crop(frame, child)
                         if child_crop is None:
                             continue
@@ -350,14 +356,27 @@ class OCRWorker(QThread):
                             # Inherit container filters, but strip coordinate-specific masks
                             c_params = {k: v for k, v in container.preprocessing_params.items() if k != "masks"}
                         config = PreprocessingConfig.from_dict(c_params)
-                        processed = self.pipeline.process(child_crop, config)
-                        
-                        ocr_res = self.engine.recognize(processed, config=f"--psm 10 -l lets -c tessedit_char_whitelist={whitelist}")
-                        if not any(ch.isdigit() or (allow_neg and ch == '-') for ch in ocr_res.raw_text):
-                            ocr_res = self.engine.recognize(processed, config=f"--psm 10 -c tessedit_char_whitelist={whitelist}")
-                        if not any(ch.isdigit() or (allow_neg and ch == '-') for ch in ocr_res.raw_text):
-                            ocr_res = self.engine.recognize(processed)
-                            
+                        slots.append((idx, child, self.pipeline.process(child_crop, config)))
+
+                    def has_valid_char(res: OCRResult) -> bool:
+                        return any(ch.isdigit() or (allow_neg and ch == '-') for ch in res.raw_text)
+
+                    # Fallback chain: each pass only re-runs the slots that found nothing yet
+                    results: Dict[int, OCRResult] = {}
+                    pending = list(range(len(slots)))
+                    for ocr_cfg in (f"--psm 10 -l lets -c tessedit_char_whitelist={whitelist}",
+                                    f"--psm 10 -c tessedit_char_whitelist={whitelist}",
+                                    None):
+                        if not pending:
+                            break
+                        batch = self._recognize_many([slots[i][2] for i in pending], ocr_cfg)
+                        for i, res in zip(pending, batch):
+                            results[i] = res
+                        pending = [i for i in pending if not has_valid_char(results[i])]
+
+                    for i, (idx, child, _) in enumerate(slots):
+                        child_key = getattr(child, "id", child.name)
+                        ocr_res = results[i]
                         valid_chars = [ch for ch in ocr_res.raw_text if ch.isdigit() or (allow_neg and ch == '-')]
                         if valid_chars:
                             self.digit_slots_cache[child_key] = valid_chars[0]
@@ -487,18 +506,21 @@ class OCRWorker(QThread):
 
         # 3. Process Standalone ROIs (not containers, not ruler, and not children of any container)
         standalone_rois = [r for r in other_rois if not getattr(r, "is_container", False) and r.name not in child_names]
+        prepared = []
         for roi in standalone_rois:
             try:
-                roi_key = getattr(roi, "id", roi.name)
                 crop = extract_roi_crop(frame, roi)
                 if crop is None:
                     continue
-                    
                 config = PreprocessingConfig.from_dict(roi.preprocessing_params)
-                processed = self.pipeline.process(crop, config)
-                
-                ocr_res = self.engine.recognize(processed)
-                
+                prepared.append((roi, self.pipeline.process(crop, config)))
+            except Exception as e:
+                print(f"OCR Error for {roi.name}: {e}")
+
+        ocr_results = self._recognize_many([img for _, img in prepared], None) if prepared else []
+        for (roi, _), ocr_res in zip(prepared, ocr_results):
+            try:
+                roi_key = getattr(roi, "id", roi.name)
                 if ocr_res.success and ocr_res.parsed_value is not None and roi.decimal_places is not None:
                     ocr_res.parsed_value = ocr_res.parsed_value / (10 ** roi.decimal_places)
                 
