@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray, QRectF
 from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 
-from instrument_reader.core.camera_devices import list_cameras, parse_source
+from instrument_reader.core.camera_devices import label_name, list_cameras, parse_source
 from instrument_reader.core.calculation import (
     CalculationChannel,
     CalculationResult,
@@ -647,6 +647,8 @@ class ControlPanel(QWidget):
     calc_channel_updated = Signal(object)
     calc_channel_deleted = Signal(str)
     stage_reset_requested = Signal()
+    # Emitted after every camera list refresh: list[CameraDevice], or None if unknown.
+    cameras_changed = Signal(object)
 
     # (label, speed factor); 0 = unpaced ("as fast as possible")
     PLAYBACK_SPEEDS = [("0.5x", 0.5), ("1x", 1.0), ("2x", 2.0), ("4x", 4.0), ("10x", 10.0), ("Max", 0.0)]
@@ -941,26 +943,41 @@ class ControlPanel(QWidget):
         return isinstance(src, str) and len(src) > 0 and not src.startswith("/dev/video")
 
     def refresh_cameras(self):
-        """Re-reads the attached cameras into the dropdown, keeping the current selection."""
+        """Re-reads the attached cameras into the dropdown, keeping the selected camera.
+
+        The selection follows the camera's name, so it stays correct when the OS
+        renumbers devices after a camera is unplugged and plugged back in.
+        """
         current = self.camera_source.text().strip()
         current_src = parse_source(current)
-        devices = list_cameras()
+        current_name = label_name(current)
+        found = list_cameras()
+        devices = found or []
 
-        self.camera_combo.blockSignals(True)
-        self.camera_combo.clear()
-        for dev in devices:
-            self.camera_combo.addItem(dev.label, dev.index)
-        self.camera_combo.blockSignals(False)
+        labels = [dev.label for dev in devices]
+        existing = [self.camera_combo.itemText(i) for i in range(self.camera_combo.count())]
+        if labels != existing or not current:
+            self.camera_combo.blockSignals(True)
+            self.camera_combo.clear()
+            for dev in devices:
+                self.camera_combo.addItem(dev.label, dev.index)
+            self.camera_combo.blockSignals(False)
 
-        match = next((i for i, dev in enumerate(devices) if dev.index == current_src), -1)
-        if match >= 0:
-            self.camera_combo.setCurrentIndex(match)
-        elif current:
-            self.camera_combo.setEditText(current)
-        elif devices:
-            self.camera_combo.setCurrentIndex(0)
-        else:
-            self.camera_combo.setEditText("0")
+            match = -1
+            if current_name is not None:
+                match = next((i for i, dev in enumerate(devices) if dev.name == current_name), -1)
+            if match < 0 and current_name is None:
+                match = next((i for i, dev in enumerate(devices) if dev.index == current_src), -1)
+            if match >= 0:
+                self.camera_combo.setCurrentIndex(match)
+            elif current:
+                self.camera_combo.setEditText(current)
+            elif devices:
+                self.camera_combo.setCurrentIndex(0)
+            else:
+                self.camera_combo.setEditText("0")
+
+        self.cameras_changed.emit(found)
 
     def set_camera_status(self, state: str, message: str):
         colors = {"connected": "#2e7d32", "connecting": "#b26a00", "reconnecting": "#c62828"}

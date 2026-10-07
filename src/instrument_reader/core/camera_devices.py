@@ -64,11 +64,12 @@ def _from_qt() -> list[CameraDevice]:
     ]
 
 
-def list_cameras() -> list[CameraDevice]:
-    """Returns the cameras currently attached, or an empty list if none can be found."""
+def list_cameras() -> list[CameraDevice] | None:
+    """Returns the cameras currently attached ([] if none), or None if they cannot be listed."""
     sources = [_from_qt]
     if sys.platform.startswith("linux"):
         sources.insert(0, _from_v4l2_sysfs)
+    result = None
     for source in sources:
         try:
             devices = source()
@@ -76,4 +77,13 @@ def list_cameras() -> list[CameraDevice]:
             continue
         if devices:
             return devices
-    return []
+        result = []
+    return result
+
+
+def label_name(text: str) -> str | None:
+    """The camera name from a dropdown label like "1: Logitech C920", else None."""
+    _, sep, name = text.partition(":")
+    if sep and _LABEL_INDEX_RE.match(text) and name.strip():
+        return name.strip()
+    return None

@@ -21,13 +21,17 @@ class FakeDevice:
 
 
 class FakeCamera:
-    def __init__(self, device: FakeDevice):
+    def __init__(self, device: FakeDevice, source=0):
         self.device = device
+        self.source = source
         self._opened = False
         self._cached_fps = None
 
     def clone(self):
-        return FakeCamera(self.device)
+        return FakeCamera(self.device, self.source)
+
+    def set_source(self, source):
+        self.source = source
 
     def open(self):
         if not self.device.connected:
@@ -138,6 +142,81 @@ def test_stop_is_quick_while_read_hangs(qtbot, fast_thread):
     thread.stop()
     assert time.monotonic() - t0 < 2.0
     device.unhang.set()
+
+
+def test_waits_while_camera_is_unplugged_instead_of_opening_another(qtbot, fast_thread):
+    device = FakeDevice()
+    thread, frames, states = _start(device, qtbot)
+
+    # The OS reports the camera gone (while the driver may still deliver placeholder frames).
+    thread.set_device(None)
+    qtbot.waitUntil(lambda: states[-1] == "reconnecting" and device.open_handles == 0, timeout=2000)
+    opens = device.opens
+    qtbot.wait(300)
+    assert device.opens == opens  # nothing else gets opened at the old index
+
+    # It comes back under a new index: reconnect there.
+    thread.set_device(1)
+    qtbot.waitUntil(lambda: states[-1] == "connected", timeout=2000)
+    assert thread.camera.source == 1
+    assert device.opens == opens + 1
+    thread.stop()
+    assert device.open_handles == 0
+
+
+def test_main_window_follows_camera_by_name(qtbot, monkeypatch):
+    from instrument_reader.gui.main_window import MainWindow
+
+    monkeypatch.setattr("instrument_reader.gui.control_panel.list_cameras", lambda: [])
+    win = MainWindow()
+    qtbot.addWidget(win)
+    calls = []
+
+    class StubThread:
+        running = True
+
+        def set_device(self, index):
+            calls.append(index)
+
+    class StubCamera:
+        source = 0
+
+    win.camera_thread, win.camera = StubThread(), StubCamera()
+    win._camera_name = "PC-LM1E Camera"
+
+    win.on_cameras_changed([CameraDevice(0, "OBS Virtual Camera")])
+    win.on_cameras_changed([])
+    win.on_cameras_changed([CameraDevice(0, "OBS Virtual Camera"), CameraDevice(1, "PC-LM1E Camera")])
+    win.on_cameras_changed(None)  # list unavailable: leave the thread alone
+    assert calls == [None, None, 1]
+    win.camera_thread = win.camera = None
+
+
+def test_reconnect_keeps_backend(monkeypatch):
+    import cv2
+    from instrument_reader.core.camera import OpenCVCamera
+
+    assert OpenCVCamera(0, cv2.CAP_V4L2).clone()._api == cv2.CAP_V4L2
+    monkeypatch.setattr("sys.platform", "win32")
+    # On Windows a camera index never falls back to DirectShow (virtual cameras live there).
+    assert OpenCVCamera(0)._api == cv2.CAP_MSMF
+    assert OpenCVCamera("video.mp4")._api is None
+
+
+def test_dropdown_follows_camera_name_when_renumbered(qtbot, monkeypatch):
+    devices = [CameraDevice(0, "PC-LM1E Camera")]
+    monkeypatch.setattr("instrument_reader.gui.control_panel.list_cameras", lambda: list(devices))
+    panel = ControlPanel()
+    qtbot.addWidget(panel)
+    assert panel.selected_source() == 0
+
+    devices[:] = [CameraDevice(0, "OBS Virtual Camera")]
+    panel.refresh_cameras()
+    assert panel.camera_source.text() == "0: PC-LM1E Camera"  # absent, selection kept
+
+    devices[:] = [CameraDevice(0, "OBS Virtual Camera"), CameraDevice(1, "PC-LM1E Camera")]
+    panel.refresh_cameras()
+    assert panel.selected_source() == 1
 
 
 @pytest.mark.parametrize("text,expected", [

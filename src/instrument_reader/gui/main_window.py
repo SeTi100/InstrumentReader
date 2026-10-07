@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -20,6 +20,7 @@ from instrument_reader.gui.runs_dashboard import RunsDashboardDialog
 from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
 from instrument_reader.gui.camera_thread import CameraThread
+from instrument_reader.core.camera_devices import label_name, parse_source
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -41,6 +42,12 @@ class MainWindow(QMainWindow):
         
         self.camera = None
         self.camera_thread = None
+        # Name of the live camera in use, so a reconnect finds it again even if the
+        # OS renumbers devices (and never silently switches to another camera).
+        self._camera_name = None
+        self._device_watch = QTimer(self)
+        self._device_watch.setInterval(500)
+        self._device_watch.timeout.connect(self.control_panel.refresh_cameras)
         
         self.setup_connections()
         self.setup_menus()
@@ -94,6 +101,13 @@ class MainWindow(QMainWindow):
             self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
             self.camera_thread.frame_ready.connect(self.recorder.write_frame)
             self.camera_thread.status_changed.connect(self.on_camera_status)
+            self._camera_name = None
+            if isinstance(src, int):
+                combo = self.control_panel.camera_combo
+                labels = [self.control_panel.camera_source.text()]
+                labels += [combo.itemText(i) for i in range(combo.count()) if parse_source(combo.itemText(i)) == src]
+                self._camera_name = next((n for n in map(label_name, labels) if n), None)
+                self._device_watch.start()
             self.camera_thread.start()
             self.ocr_worker.start()
 
@@ -103,6 +117,7 @@ class MainWindow(QMainWindow):
                     if not self.camera_thread.paused:
                         self.camera_thread.pause()
                         return
+                self._device_watch.stop()
                 self.camera_thread.stop()
                 self.camera_thread = None
                 self.camera = None
@@ -112,6 +127,7 @@ class MainWindow(QMainWindow):
                 self.recorder.stop_recording()
                 self.control_panel.set_recording(False)
 
+        self.control_panel.cameras_changed.connect(self.on_cameras_changed)
         self.control_panel.start_btn.clicked.connect(start_camera)
         self.control_panel.stop_btn.clicked.connect(stop_camera)
         self.control_panel.fwd_btn.clicked.connect(lambda: self.seek_video(5.0))
@@ -174,6 +190,18 @@ class MainWindow(QMainWindow):
                 ret, frame = self.camera.read()
                 if ret and frame is not None:
                     self.video_widget.update_frame(frame)
+
+    def on_cameras_changed(self, devices):
+        """Keeps the live camera thread pointed at the selected camera's current index."""
+        thread = self.camera_thread
+        if thread is None or not thread.running or self._camera_name is None or devices is None:
+            return
+        matches = [d.index for d in devices if d.name == self._camera_name]
+        if not matches:
+            thread.set_device(None)
+        else:
+            current = getattr(self.camera, "source", None)
+            thread.set_device(current if current in matches else matches[0])
 
     def on_camera_status(self, state: str, message: str):
         self.control_panel.set_camera_status(state, message)

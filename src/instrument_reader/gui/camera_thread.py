@@ -94,10 +94,28 @@ class CameraThread(QThread):
         # a frame it needs; used in unpaced mode so OCR never misses a sample.
         self.backpressure = None
         self._resync = True
+        # Set from the GUI thread, which watches the OS camera list (see set_device()).
+        self._device_available = True
+        self._retarget = False
 
     def set_playback_speed(self, speed: float):
         self.playback_speed = max(0.0, float(speed))
         self._resync = True
+
+    def set_device(self, index: int | None):
+        """Tells a live camera thread where its camera currently is in the OS device list.
+
+        None means the camera is unplugged: the thread drops its connection at once and
+        waits instead of opening whatever device now sits at the old index. A new index
+        (the device list was renumbered) makes the thread reconnect there.
+        """
+        if index is None:
+            self._device_available = False
+            return
+        if hasattr(self.camera, "set_source") and index != getattr(self.camera, "source", index):
+            self.camera.set_source(index)
+            self._retarget = True
+        self._device_available = True
 
     def run(self):
         self.running = True
@@ -191,6 +209,25 @@ class CameraThread(QThread):
         self._set_state("connecting", "Verbinde mit Kamera …")
         try:
             while self.running:
+                if not self._device_available:
+                    if session is not None:
+                        session.stop()
+                        session = None
+                    attempt = 0
+                    self._set_state(
+                        "reconnecting" if ever_connected else "connecting",
+                        "Kamera getrennt – warte, bis sie wieder da ist …",
+                    )
+                    self.msleep(20)
+                    continue
+
+                if self._retarget:
+                    self._retarget = False
+                    if session is not None:
+                        session.stop()
+                        session = None
+                        attempt = 0
+
                 if session is None:
                     delay = self.RECONNECT_DELAYS_S[min(attempt, len(self.RECONNECT_DELAYS_S) - 1)]
                     self._sleep(delay)
@@ -205,8 +242,8 @@ class CameraThread(QThread):
                 if session.last_frame_at is not None:
                     if attempt:
                         # The device answered: adopt the real frame rate and reset the backoff.
-                        if hasattr(self.camera, "_cached_fps"):
-                            self.camera._cached_fps = session.camera.fps
+                        if hasattr(self.camera, "adopt"):
+                            self.camera.adopt(session.camera)
                         attempt = 0
                         ever_connected = True
                         self._set_state("connected", "Kamera verbunden")
