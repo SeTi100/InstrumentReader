@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import time
 from datetime import datetime
 
@@ -69,12 +68,11 @@ class OpenCVCamera(CameraSource):
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
         self._start_epoch: float | None = None
-        if api_preference is None and _is_plain_index(source) and sys.platform.startswith("win"):
-            # Media Foundation is what OpenCV picks first on Windows and what the camera
-            # list is read from. Pinning it stops OpenCV from silently falling back to
-            # DirectShow, whose index 0 may be a virtual camera (e.g. OBS) while the
-            # real camera is unplugged.
-            api_preference = cv2.CAP_MSMF
+        # None: OpenCV picks the backend on the first open (Media Foundation first on
+        # Windows, then DirectShow, so typed indices reach DirectShow-only virtual cameras
+        # too). open() then records the backend that worked, and clone() passes it on, so
+        # a reconnect can never fall through to another backend's device list (where
+        # index 0 may be a virtual placeholder camera such as OBS).
         self._api = api_preference
 
     @property
