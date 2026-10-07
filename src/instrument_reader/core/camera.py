@@ -58,13 +58,18 @@ def _backend_id(name: str) -> int | None:
     return None
 
 
+def _is_plain_index(source) -> bool:
+    """True for a bare camera index; False for paths and backend-encoded indices like 701."""
+    return isinstance(source, int) and 0 <= source < 100
+
+
 class OpenCVCamera(CameraSource):
     def __init__(self, source: int | str = 0, api_preference: int | None = None):
         self._source = source
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
         self._start_epoch: float | None = None
-        if api_preference is None and isinstance(source, int) and sys.platform.startswith("win"):
+        if api_preference is None and _is_plain_index(source) and sys.platform.startswith("win"):
             # Media Foundation is what OpenCV picks first on Windows and what the camera
             # list is read from. Pinning it stops OpenCV from silently falling back to
             # DirectShow, whose index 0 may be a virtual camera (e.g. OBS) while the
@@ -93,14 +98,17 @@ class OpenCVCamera(CameraSource):
         # Never leave a stale handle behind: a capture that is not released keeps
         # the device locked for other applications (e.g. OBS) until the process exits.
         self.release()
-        if self._api is None:
+        if isinstance(self._source, int) and not _is_plain_index(self._source):
+            # OpenCV's encoded form: 701 = device 1 of backend 700 (DirectShow).
+            cap = cv2.VideoCapture(self._source % 100, self._source - self._source % 100)
+        elif self._api is None:
             cap = cv2.VideoCapture(self._source)
         else:
             cap = cv2.VideoCapture(self._source, self._api)
         if not cap.isOpened():
             cap.release()
             return False
-        if self._api is None and isinstance(self._source, int):
+        if self._api is None and _is_plain_index(self._source):
             # Reconnects must use the same backend, or a different device list applies.
             try:
                 self._api = _backend_id(cap.getBackendName())
