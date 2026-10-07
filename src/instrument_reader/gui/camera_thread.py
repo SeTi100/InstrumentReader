@@ -65,6 +65,8 @@ class _LiveSession:
 
 class CameraThread(QThread):
     frame_ready = Signal(object)
+    # (frame, epoch timestamp of the frame) - video time for files, wall clock for live cameras
+    frame_captured = Signal(object, float)
     # (state, message); state is one of "connecting", "connected", "reconnecting", "stopped"
     status_changed = Signal(str, str)
 
@@ -75,6 +77,8 @@ class CameraThread(QThread):
     # Delay before each reconnect attempt; the last value repeats.
     RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
     STOP_JOIN_TIMEOUT_S = 1.0
+    # Max. rate of GUI frame updates while a video runs unpaced
+    DISPLAY_INTERVAL_S = 1.0 / 30.0
 
     def __init__(self, camera):
         super().__init__()
@@ -84,9 +88,19 @@ class CameraThread(QThread):
         self._lock = QMutex()
         self.state = "stopped"
         self._status_message = ""
+        # Playback speed for video files: 1.0 = real time, 0 = as fast as possible
+        self.playback_speed = 1.0
+        # Optional callable(keep_going) that blocks until the consumer has taken
+        # a frame it needs; used in unpaced mode so OCR never misses a sample.
+        self.backpressure = None
+        self._resync = True
         # Set from the GUI thread, which watches the OS camera list (see set_device()).
         self._device_available = True
         self._retarget = False
+
+    def set_playback_speed(self, speed: float):
+        self.playback_speed = max(0.0, float(speed))
+        self._resync = True
 
     def set_device(self, index: int | None):
         """Tells a live camera thread where its camera currently is in the OS device list.
@@ -116,28 +130,65 @@ class CameraThread(QThread):
             self.running = False
             return
 
+        is_video = getattr(self.camera, "is_video_file", False)
+        anchor_wall = anchor_video = 0.0
+        last_display = 0.0
+
         while self.running:
             if self.paused:
+                self._resync = True
                 self.msleep(50)
                 continue
 
             self._lock.lock()
             ret, frame = self.camera.read()
+            ts = self.camera.frame_timestamp() if ret else 0.0
             self._lock.unlock()
 
-            if ret and frame is not None:
+            if not (ret and frame is not None):
+                if is_video:
+                    self.paused = True
+                else:
+                    self.msleep(10)
+                continue
+
+            if not is_video:
+                # Non-reconnecting live source: read() already blocks until the next frame
+                self.frame_ready.emit(frame)
+                self.frame_captured.emit(frame, ts)
+                continue
+
+            speed = self.playback_speed
+            now = time.monotonic()
+            if speed > 0:
+                # Pace against the video clock instead of sleeping 1/fps after
+                # every frame, so decoding/processing time is not added on top.
+                if self._resync:
+                    anchor_wall, anchor_video = now, ts
+                    self._resync = False
+                delay = anchor_wall + (ts - anchor_video) / speed - now
+                if delay < -0.5:
+                    # Too far behind (slow decode): re-anchor instead of bursting
+                    anchor_wall, anchor_video = now, ts
+                # Sleep in small slices so pause/stop/seek stay responsive
+                while delay > 0 and self.running and not self.paused and not self._resync:
+                    self.msleep(max(1, int(min(delay, 0.05) * 1000)))
+                    delay = anchor_wall + (ts - anchor_video) / speed - time.monotonic()
                 self.frame_ready.emit(frame)
             else:
-                if getattr(self.camera, "is_video_file", False):
-                    self.paused = True
+                self._resync = True
+                if now - last_display >= self.DISPLAY_INTERVAL_S:
+                    last_display = now
+                    self.frame_ready.emit(frame)
 
-            fps = self.camera.fps
-            interval = int(1000 / fps) if fps > 0 else 33
-            self.msleep(interval)
+            self.frame_captured.emit(frame, ts)
+            if speed <= 0 and self.backpressure is not None:
+                self.backpressure(lambda: self.running and not self.paused)
 
     def _emit_frame(self, frame):
         if self.running and not self.paused:
             self.frame_ready.emit(frame)
+            self.frame_captured.emit(frame, time.time())
 
     def _set_state(self, state: str, message: str):
         if state != self.state or message != self._status_message:
@@ -222,6 +273,7 @@ class CameraThread(QThread):
         self.paused = True
 
     def resume(self):
+        self._resync = True
         self.paused = False
 
     def seek(self, seconds: float):
@@ -229,10 +281,12 @@ class CameraThread(QThread):
         try:
             if self.camera:
                 self.camera.seek(seconds)
+                self._resync = True
                 if self.paused:
                     ret, frame = self.camera.read()
                     if ret and frame is not None:
                         self.frame_ready.emit(frame)
+                        self.frame_captured.emit(frame, self.camera.frame_timestamp())
         finally:
             self._lock.unlock()
 
@@ -241,10 +295,12 @@ class CameraThread(QThread):
         try:
             if self.camera:
                 self.camera.seek_to_frame(frame_num)
+                self._resync = True
                 if self.paused:
                     ret, frame = self.camera.read()
                     if ret and frame is not None:
                         self.frame_ready.emit(frame)
+                        self.frame_captured.emit(frame, self.camera.frame_timestamp())
         finally:
             self._lock.unlock()
 
