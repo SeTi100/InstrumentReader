@@ -1,8 +1,9 @@
+import threading
 import time
 import cv2
 import numpy as np
 from typing import Optional, List, Dict, Set, Tuple
-from PySide6.QtCore import QThread, Signal, QMutex, QMutexLocker
+from PySide6.QtCore import QThread, Signal
 from instrument_reader.core.ocr_engine import TesseractEngine, OCRResult
 from instrument_reader.core.preprocessing import PreprocessingPipeline, PreprocessingConfig
 from instrument_reader.core.validator import ValueValidator
@@ -73,7 +74,11 @@ class OCRWorker(QThread):
         self.running = False
         self.rois: List[ROIConfig] = []
         self.current_frame = None
-        self.mutex = QMutex()
+        # Epoch timestamp of current_frame (video time for files, wall clock for live)
+        self.current_ts: Optional[float] = None
+        self._cond = threading.Condition()
+        self._last_taken_ts: Optional[float] = None
+        self._next_due_ts: Optional[float] = None
         self.engine = TesseractEngine()
         self.pipeline = PreprocessingPipeline()
         self.validator = ValueValidator()
@@ -83,21 +88,56 @@ class OCRWorker(QThread):
         self.last_timestamps: Dict[str, float] = {}
         self.digit_slots_cache: Dict[str, str] = {}
         
-    def update_frame(self, frame):
-        with QMutexLocker(self.mutex):
+    def update_frame(self, frame, timestamp: Optional[float] = None):
+        ts = time.time() if timestamp is None else float(timestamp)
+        with self._cond:
+            if self._last_taken_ts is not None and ts < self._last_taken_ts:
+                # Jumped backwards (seek / video restarted): restart the sampling
+                # schedule and forget per-ROI history so dt stays positive.
+                self._reset_schedule_locked()
             self.current_frame = frame
-            
+            self.current_ts = ts
+            self._cond.notify_all()
+
     def update_rois(self, rois):
-        with QMutexLocker(self.mutex):
+        with self._cond:
             self.rois = list(rois)
             self.last_valid_values.clear()
             self.last_timestamps.clear()
             self.digit_slots_cache.clear()
-            
+            self._cond.notify_all()
+
     def set_interval(self, interval_ms):
-        with QMutexLocker(self.mutex):
+        with self._cond:
             self.interval_ms = interval_ms
-            
+            self._next_due_ts = None
+            self._cond.notify_all()
+
+    def _reset_schedule_locked(self):
+        self._last_taken_ts = None
+        self._next_due_ts = None
+        self.last_valid_values.clear()
+        self.last_timestamps.clear()
+        self.digit_slots_cache.clear()
+
+    def _frame_due_locked(self) -> bool:
+        """True if the current frame should be read: new, and at least one
+        logging interval (in frame time) after the previously read frame."""
+        if self.current_frame is None or not self.rois or self.current_ts is None:
+            return False
+        if self._last_taken_ts is not None and self.current_ts <= self._last_taken_ts:
+            return False
+        return self._next_due_ts is None or self.current_ts >= self._next_due_ts
+
+    def wait_while_pending(self, keep_going=lambda: True):
+        """
+        Blocks while the current frame is due but not yet picked up by the worker.
+        Called by the camera thread in unpaced playback so no sample is skipped.
+        """
+        with self._cond:
+            while self.running and keep_going() and self._frame_due_locked():
+                self._cond.wait(0.05)
+
     def resolve_hierarchy(self, rois: List[ROIConfig]) -> Tuple[Dict[str, List[ROIConfig]], Set[str]]:
         """
         Determines which ROIs are containers and maps each container to its children.
@@ -130,22 +170,28 @@ class OCRWorker(QThread):
     def run(self):
         self.running = True
         while self.running:
-            start_time = time.time()
-            
-            with QMutexLocker(self.mutex):
-                frame = self.current_frame.copy() if self.current_frame is not None else None
+            with self._cond:
+                if not self._frame_due_locked():
+                    self._cond.wait(0.05)
+                    continue
+                frame = self.current_frame.copy()
+                ts = self.current_ts
                 rois = list(self.rois)
-                
-            if frame is not None and rois:
-                readings = self.process_frame(frame, rois, start_time)
-                if readings:
-                    self.readings_ready.emit(readings)
-                
-            elapsed = (time.time() - start_time) * 1000
-            with QMutexLocker(self.mutex):
-                sleep_time = max(10, int(self.interval_ms - elapsed))
-                
-            self.msleep(sleep_time)
+                # Schedule on a fixed grid in frame time so the logging interval
+                # means the same thing for live cameras and for (sped up) videos.
+                interval = self.interval_ms / 1000.0
+                if self._next_due_ts is None or ts - self._next_due_ts >= interval:
+                    self._next_due_ts = ts + interval
+                else:
+                    self._next_due_ts += interval
+                self._last_taken_ts = ts
+                self._cond.notify_all()
+
+            readings = self.process_frame(frame, rois, ts)
+            if readings:
+                for r in readings:
+                    r["timestamp"] = ts
+                self.readings_ready.emit(readings)
 
     def process_frame(self, frame: np.ndarray, rois: List[ROIConfig], now: Optional[float] = None) -> List[dict]:
         if now is None:
@@ -530,6 +576,8 @@ class OCRWorker(QThread):
 
             
     def stop(self):
-        self.running = False
+        with self._cond:
+            self.running = False
+            self._cond.notify_all()
         self.wait()
 

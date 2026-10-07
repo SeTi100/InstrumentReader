@@ -106,11 +106,22 @@ class DatabaseWriter(QObject):
         self.current_phase = phase
 
     @Slot(list)
-    def insert_readings(self, readings):
+    def insert_readings(self, readings, timestamp: Optional[float] = None):
+        """
+        Logs a batch of readings. timestamp (epoch seconds) is the time of the
+        frame they were read from - video time for files - and defaults to the
+        first reading's "timestamp", then to the current wall-clock time.
+        """
         if not self.current_run_id:
             return
-            
-        now_str = datetime.now().isoformat()
+
+        if timestamp is None:
+            timestamp = next(
+                (r["timestamp"] for r in readings if isinstance(r.get("timestamp"), (int, float))),
+                None,
+            )
+        ts_dt = datetime.fromtimestamp(timestamp) if timestamp is not None else datetime.now()
+        now_str = ts_dt.isoformat()
         with sqlite3.connect(self.db.db_path) as conn:
             cursor = conn.cursor()
             for r in readings:

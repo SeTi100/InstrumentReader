@@ -87,7 +87,11 @@ class MainWindow(QMainWindow):
             self.camera = OpenCVCamera(src)
             self.camera_thread = CameraThread(self.camera)
             self.camera_thread.frame_ready.connect(self.video_widget.update_frame)
-            self.camera_thread.frame_ready.connect(self.ocr_worker.update_frame)
+            # Direct connection: OCRWorker.update_frame is mutex-protected and must see
+            # every frame (with its timestamp) even when the GUI thread is busy.
+            self.camera_thread.frame_captured.connect(self.ocr_worker.update_frame, Qt.DirectConnection)
+            self.camera_thread.backpressure = self.ocr_worker.wait_while_pending
+            self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
             self.camera_thread.frame_ready.connect(self.recorder.write_frame)
             self.camera_thread.status_changed.connect(self.on_camera_status)
             self.camera_thread.start()
@@ -121,6 +125,7 @@ class MainWindow(QMainWindow):
         self.control_panel.ruler_btn.clicked.connect(lambda: self.set_draw_mode(ROIShape.RULER))
         
         self.control_panel.interval_spin.valueChanged.connect(self.ocr_worker.set_interval)
+        self.control_panel.speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
         self.control_panel.new_exp_btn.clicked.connect(self.create_experiment)
         self.control_panel.new_run_btn.clicked.connect(self.create_new_run)
         self.control_panel.dashboard_btn.clicked.connect(self.open_runs_dashboard)
@@ -142,6 +147,10 @@ class MainWindow(QMainWindow):
         self.calc_engine.reset_scale_detector(hard=False)
         self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
         self.db_writer.set_phase("STAGE_1")
+
+    def _on_playback_speed_changed(self, _index=None):
+        if self.camera_thread:
+            self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
 
     def seek_video(self, seconds: float):
         # Clear calculation engine history buffer and reset scale step detector
@@ -564,7 +573,7 @@ class MainWindow(QMainWindow):
                 "is_calculated": 1,
             })
 
-        self.db_writer.insert_readings(all_readings)
+        self.db_writer.insert_readings(all_readings, timestamp=ts)
 
     def _get_current_evaluation_values(self):
         current_vals = {

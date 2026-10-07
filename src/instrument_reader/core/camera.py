@@ -1,3 +1,8 @@
+import os
+import re
+import time
+from datetime import datetime
+
 import cv2
 import numpy as np
 from abc import ABC, abstractmethod
@@ -40,12 +45,17 @@ class CameraSource(ABC):
     def get_frame_count(self) -> float:
         return 0.0
 
+    def frame_timestamp(self) -> float:
+        """Epoch timestamp (seconds) of the frame returned by the last read()."""
+        return time.time()
+
 
 class OpenCVCamera(CameraSource):
     def __init__(self, source: int | str = 0):
         self._source = source
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
+        self._start_epoch: float | None = None
 
     @property
     def source(self) -> int | str:
@@ -66,6 +76,8 @@ class OpenCVCamera(CameraSource):
         self._cap = cap
         val = cap.get(cv2.CAP_PROP_FPS)
         self._cached_fps = float(val) if val and val > 0 else 30.0
+        if self.is_video_file:
+            self._start_epoch = self._guess_start_epoch()
         return True
 
     def read(self) -> tuple[bool, np.ndarray | None]:
@@ -156,3 +168,42 @@ class OpenCVCamera(CameraSource):
             return 0.0
         return self._cap.get(cv2.CAP_PROP_FRAME_COUNT)
 
+
+    def get_position_seconds(self) -> float:
+        """Video time (seconds) of the frame returned by the last read()."""
+        if self._cap is None or not self.is_video_file:
+            return 0.0
+        # POS_FRAMES points at the next frame to decode
+        return max(0.0, self._cap.get(cv2.CAP_PROP_POS_FRAMES) - 1) / self.fps
+
+    def frame_timestamp(self) -> float:
+        """
+        Epoch timestamp (seconds) of the frame returned by the last read().
+        Live cameras use wall-clock time; video files use the recording start
+        plus the frame's position in the video, so offline analysis yields the
+        same time axis as the original recording, independent of playback speed.
+        """
+        if not self.is_video_file:
+            return time.time()
+        if self._start_epoch is None:
+            self._start_epoch = self._guess_start_epoch()
+        return self._start_epoch + self.get_position_seconds()
+
+    def _guess_start_epoch(self) -> float:
+        """
+        Best guess for the wall-clock time at which the video was recorded:
+        a YYYYMMDD_HHMMSS stamp in the file name (as written by VideoRecorder),
+        otherwise the file modification time minus the video duration.
+        """
+        name = os.path.basename(str(self._source))
+        m = re.search(r"(\d{8}_\d{6})", name)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y%m%d_%H%M%S").timestamp()
+            except ValueError:
+                pass
+        try:
+            duration = self.get_frame_count() / self.fps if self._cap else 0.0
+            return os.path.getmtime(str(self._source)) - max(0.0, duration)
+        except OSError:
+            return time.time()

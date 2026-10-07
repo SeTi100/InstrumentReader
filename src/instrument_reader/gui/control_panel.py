@@ -648,6 +648,9 @@ class ControlPanel(QWidget):
     calc_channel_deleted = Signal(str)
     stage_reset_requested = Signal()
 
+    # (label, speed factor); 0 = unpaced ("as fast as possible")
+    PLAYBACK_SPEEDS = [("0.5x", 0.5), ("1x", 1.0), ("2x", 2.0), ("4x", 4.0), ("10x", 10.0), ("Max", 0.0)]
+
     def __init__(self):
         super().__init__()
         outer_layout = QVBoxLayout(self)
@@ -765,6 +768,16 @@ class ControlPanel(QWidget):
         self.interval_spin.setRange(100, 10000)
         self.interval_spin.setValue(1000)
         settings_layout.addWidget(self.interval_spin)
+        settings_layout.addWidget(QLabel("Video Speed:"))
+        self.speed_combo = QComboBox()
+        for label, speed in self.PLAYBACK_SPEEDS:
+            self.speed_combo.addItem(label, speed)
+        self.speed_combo.setCurrentIndex(1)
+        self.speed_combo.setToolTip(
+            "Playback speed for video files. 'Max' analyses the video as fast as possible; "
+            "readings are timestamped with video time, so rates stay correct at any speed."
+        )
+        settings_layout.addWidget(self.speed_combo)
         layout.addWidget(settings_group)
 
         # Experiment Info
@@ -1017,6 +1030,10 @@ class ControlPanel(QWidget):
     def lock_backwards(self):
         self.unlock_back_cb.setChecked(False)
         self.back_btn.setEnabled(False)
+
+    def playback_speed(self) -> float:
+        speed = self.speed_combo.currentData()
+        return float(speed) if speed is not None else 1.0
 
     def set_recording(self, recording: bool):
         if recording:
