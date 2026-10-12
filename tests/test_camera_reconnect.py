@@ -443,13 +443,13 @@ def test_other_backend_found_by_name(monkeypatch):
     assert OpenCVCamera("run.mp4").next_route() == "direct"
 
 
-def _clip(tmp_path, frames=5):
+def _clip(tmp_path, frames=5, size=(32, 24)):
     import cv2
 
     path = str(tmp_path / "clip.avi")
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (32, 24))
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0, size)
     for i in range(frames):
-        writer.write(np.full((24, 32, 3), (i * 40) % 256, dtype=np.uint8))
+        writer.write(np.full((size[1], size[0], 3), (i * 40) % 256, dtype=np.uint8))
     writer.release()
     return path
 
@@ -459,12 +459,14 @@ def test_helper_process_capture_reads_frames(tmp_path):
     import cv2
     from instrument_reader.core.camera_process import ProcessCapture
 
-    cap = ProcessCapture(_clip(tmp_path))
+    # Camera-sized frames: larger than one pipe write on Windows.
+    cap = ProcessCapture(_clip(tmp_path, frames=30, size=(640, 480)))
     try:
         assert cap.isOpened()
         assert cap.get(cv2.CAP_PROP_FPS) == 10.0
-        ok, frame = cap.read()
-        assert ok and frame.shape == (24, 32, 3)
+        for _ in range(30):
+            ok, frame = cap.read()
+            assert ok and frame.shape == (480, 640, 3)
         frame[0, 0] = 255  # downstream code may draw on frames
     finally:
         cap.release()

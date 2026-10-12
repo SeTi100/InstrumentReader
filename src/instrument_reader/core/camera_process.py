@@ -57,7 +57,9 @@ def _capture_loop(source, api, name, other_backend, conn, stop):
             failures = 0
             frame = np.ascontiguousarray(frame)
             conn.send(("frame", (frame.shape, frame.dtype.str)))
-            conn.send_bytes(frame)
+            # Flat byte view: for a 3-D array len() counts rows, not bytes, which breaks
+            # send_bytes on Windows pipes for frames larger than one write.
+            conn.send_bytes(memoryview(frame).cast("B"))
         cap.release()
     except (EOFError, OSError):
         pass
