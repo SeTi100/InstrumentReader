@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
                 labels = [self.control_panel.camera_source.text()]
                 labels += [combo.itemText(i) for i in range(combo.count()) if parse_source(combo.itemText(i)) == src]
                 self._camera_name = next((n for n in map(label_name, labels) if n), None)
+                self.camera.name = self._camera_name
                 self._device_watch.start()
             self.camera_thread.start()
             self.ocr_worker.start()

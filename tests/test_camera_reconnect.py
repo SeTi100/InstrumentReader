@@ -197,7 +197,10 @@ def test_reconnect_keeps_backend(monkeypatch):
     from instrument_reader.core import camera as camera_mod
     from instrument_reader.core.camera import OpenCVCamera
 
-    assert OpenCVCamera(0, cv2.CAP_V4L2).clone()._api == cv2.CAP_V4L2
+    # Any backend this OpenCV build has (V4L2 only exists on Linux builds).
+    api = cv2.videoio_registry.getBackends()[0]
+    name = cv2.videoio_registry.getBackendName(api)
+    assert OpenCVCamera(0, api).clone()._api == api
 
     # A typed index lets OpenCV pick any backend (so DirectShow-only virtual cameras
     # work), then sticks to the backend that opened it for every reconnect.
@@ -211,7 +214,7 @@ def test_reconnect_keeps_backend(monkeypatch):
             return True
 
         def getBackendName(self):
-            return "V4L2"
+            return name
 
         def get(self, prop):
             return 30.0
@@ -226,7 +229,7 @@ def test_reconnect_keeps_backend(monkeypatch):
     assert cam.open() is True
     clone = cam.clone()
     assert clone.open() is True
-    assert opened == [(1,), (1, cv2.CAP_V4L2)]
+    assert opened == [(1,), (1, api)]
 
 
 def test_dropdown_follows_camera_name_when_renumbered(qtbot, monkeypatch):
@@ -363,3 +366,97 @@ def test_opening_dropdown_rescans(qtbot, monkeypatch):
     assert [panel.camera_combo.itemText(i) for i in range(panel.camera_combo.count())] == [
         "0: PC-LM1E Camera", "701: Simulator Cam",
     ]
+
+
+class StuckRouteCamera(FakeCamera):
+    """After a camera-service crash, the direct route keeps failing in this process."""
+
+    routes_tried = []
+
+    def __init__(self, device, source=0):
+        super().__init__(device, source)
+        self.route = "direct"
+
+    def clone(self):
+        twin = StuckRouteCamera(self.device, self.source)
+        twin.route = self.route
+        return twin
+
+    def next_route(self):
+        self.route = {"direct": "other", "other": "process", "process": "direct"}[self.route]
+        return self.route
+
+    def adopt(self, other):
+        self.route = other.route
+
+    def open(self):
+        StuckRouteCamera.routes_tried.append(self.route)
+        if self.route == "direct":
+            return False
+        return super().open()
+
+
+def test_switches_route_when_reconnects_keep_failing(qtbot, fast_thread):
+    StuckRouteCamera.routes_tried = []
+    device = FakeDevice()
+    thread = CameraThread(StuckRouteCamera(device))
+    states = []
+    thread.status_changed.connect(lambda st, msg: states.append(st))
+    thread.start()
+    qtbot.waitUntil(lambda: bool(states) and states[-1] == "connected", timeout=3000)
+    tried = StuckRouteCamera.routes_tried
+    assert tried[: CameraThread.ROUTE_SWITCH_AFTER] == ["direct"] * CameraThread.ROUTE_SWITCH_AFTER
+    assert tried[-1] == "other"
+    assert thread.camera.route == "other"
+    thread.stop()
+    assert device.open_handles == 0
+
+
+def test_next_route_cycles_and_skips_missing_backend(monkeypatch):
+    import cv2
+    from instrument_reader.core import camera_devices
+    from instrument_reader.core.camera import OpenCVCamera
+
+    monkeypatch.setattr("sys.platform", "win32")
+    lists = {cv2.CAP_MSMF: {0: "PC-LM1E Camera"}, cv2.CAP_DSHOW: {0: "OBS Virtual Camera", 1: "PC-LM1E Camera"}}
+
+    def fake_index(api, name=None, index=None):
+        for i, n in lists[api].items():
+            if (name is not None and n == name) or (name is None and i == index):
+                return i, n
+        return None
+
+    monkeypatch.setattr(camera_devices, "windows_device_index", fake_index)
+    cam = OpenCVCamera(0, cv2.CAP_MSMF)
+    assert cam._other_backend_target() == (1, cv2.CAP_DSHOW)  # found by name, not index
+    assert cam.name == "PC-LM1E Camera"
+    assert [cam.next_route() for _ in range(3)] == ["other", "process", "direct"]
+    assert cam.clone().route == "direct"
+
+    lists[cv2.CAP_DSHOW] = {}
+    assert [cam.next_route() for _ in range(2)] == ["process", "direct"]
+    assert OpenCVCamera("run.mp4").next_route() == "direct"
+
+
+def test_helper_process_capture_reads_frames(monkeypatch):
+    """The helper process delivers frames (from a video file standing in for a camera)."""
+    import cv2
+    from instrument_reader.core.camera_process import ProcessCapture
+
+    import tempfile, os
+    path = os.path.join(tempfile.mkdtemp(), "clip.avi")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (32, 24))
+    for i in range(5):
+        writer.write(np.full((24, 32, 3), i * 40, dtype=np.uint8))
+    writer.release()
+
+    cap = ProcessCapture(path)
+    try:
+        assert cap.isOpened()
+        assert cap.get(cv2.CAP_PROP_FPS) == 10.0
+        ok, frame = cap.read()
+        assert ok and frame.shape == (24, 32, 3)
+    finally:
+        cap.release()
+    assert not cap._proc.is_alive()
+    assert ProcessCapture(os.path.join(os.path.dirname(path), "missing.avi")).isOpened() is False
