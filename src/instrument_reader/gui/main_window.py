@@ -99,7 +99,9 @@ class MainWindow(QMainWindow):
             self.camera_thread.frame_captured.connect(self.ocr_worker.update_frame, Qt.DirectConnection)
             self.camera_thread.backpressure = self.ocr_worker.wait_while_pending
             self.camera_thread.set_playback_speed(self.control_panel.playback_speed())
-            self.camera_thread.frame_ready.connect(self.recorder.write_frame)
+            # Direct connection with the capture time: the recorder only queues a copy,
+            # and its timestamp log must not depend on how busy the GUI thread is.
+            self.camera_thread.frame_captured.connect(self.recorder.write_frame, Qt.DirectConnection)
             self.camera_thread.status_changed.connect(self.on_camera_status)
             self._camera_name = None
             if isinstance(src, int):
