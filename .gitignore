@@ -19,3 +19,10 @@ recordings/
 *.mkv
 *.csv
 
+
+# Measurement databases (local data, never commit)
+*.db
+*.db.bak
+*.db-journal
+*.db-wal
+*.db-shm
