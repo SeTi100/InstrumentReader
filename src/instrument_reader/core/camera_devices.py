@@ -102,6 +102,17 @@ def list_cameras() -> list[CameraDevice] | None:
     return result
 
 
+def windows_listing_incomplete() -> bool:
+    """True on Windows when DirectShow cameras (most virtual cameras) cannot be listed."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import cv2_enumerate_cameras  # noqa: F401
+    except Exception:
+        return True
+    return False
+
+
 def label_name(text: str) -> str | None:
     """The camera name from a dropdown label like "1: Logitech C920", else None."""
     _, sep, name = text.partition(":")
