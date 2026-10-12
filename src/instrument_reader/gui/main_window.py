@@ -1,10 +1,13 @@
 import json
+import logging
+import os
 import uuid
 from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
 from PySide6.QtCore import Qt, QTimer
+from instrument_reader.core import data_safety
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -25,13 +28,20 @@ from instrument_reader.core.camera_devices import label_name, parse_source
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Instrument Reader - Phase 1.1")
         self.setMinimumSize(1200, 800)
-        
+
         self.db_writer = DatabaseWriter()
+        # Show where the data goes, so a run from the wrong folder is obvious.
+        self.setWindowTitle(f"Instrument Reader - Phase 1.1 – Daten: {os.path.dirname(os.path.abspath(self.db_writer.db.db_path))}")
         self.ocr_worker = OCRWorker()
         self.calc_engine = CalculationEngine()
-        self.recorder = VideoRecorder(output_dir="recordings")
+        self.recorder = VideoRecorder(output_dir=data_safety.recordings_dir())
+        # Database backups: every 30 min, after each run and on close (see core/data_safety.py).
+        self._backup_timer = QTimer(self)
+        self._backup_timer.setInterval(data_safety.BACKUP_INTERVAL_S * 1000)
+        self._backup_timer.timeout.connect(lambda: self.backup_database("auto"))
+        self._backup_timer.start()
+        self.db_writer.run_ended.connect(lambda _run_id: self.backup_database("run"))
         self.db_writer.set_phase(f"STAGE_{self.calc_engine.step_detector.stage}")
         self._roi_counter = 1
         self.current_experiment_id = None
@@ -856,5 +866,17 @@ class MainWindow(QMainWindow):
             self.camera = None
         self.ocr_worker.stop()
         self.db_writer.end_run()
+        self._backup_timer.stop()
+        self.backup_database("close")
         event.accept()
+
+    def backup_database(self, reason: str) -> None:
+        """Backs up the database and remembers its size; never interrupts a measurement."""
+        db = self.db_writer.db.db_path
+        try:
+            data_safety.backup_database(db, reason)
+            data_safety.save_state(db)
+        except Exception:
+            logging.getLogger(__name__).exception("Datenbank-Backup fehlgeschlagen")
+            self.statusBar().showMessage("Achtung: Datenbank-Backup fehlgeschlagen, siehe Konsole", 30000)
 

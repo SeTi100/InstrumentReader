@@ -35,7 +35,38 @@ uv run --extra dev pytest
   wie möglich, ohne Messintervalle zu überspringen). Zurückspulen muss erst
   freigeschaltet werden.
 
-Die Messwerte landen in `instrument_reader.db` im Startordner.
+Alle Daten liegen im Datenordner, siehe [Datensicherheit](#datensicherheit).
+
+## Datensicherheit
+
+Alle Messdaten liegen **außerhalb des Programmordners** in
+`%USERPROFILE%\InstrumentReader-Daten\` (änderbar mit `INSTRUMENT_READER_DATA_DIR`).
+Kein Git-Befehl im Programmordner kann sie damit überschreiben oder löschen. Liegt der
+Datenordner selbst in einem Git-Ordner, startet die App nicht.
+
+| Datei / Ordner | Inhalt |
+|---|---|
+| `instrument_reader.db` | Die Datenbank (Experimente, Runs, Messwerte, ROI-Presets) |
+| `journal/JJJJ-MM-TT.jsonl` | **Nur anhängbares Journal** aller Schreibvorgänge; vergangene Tage schreibgeschützt |
+| `backups/` | Automatische Backups: beim Start, nach jedem Run, alle 30 min und beim Schließen |
+| `recordings/` | Videoaufnahmen mit Zeitstempel-Dateien |
+| `state.json` | Wie viele Daten beim letzten Mal da waren |
+| `settings.json` | Optional, z. B. `{"backup_mirror": "D:\\Backups"}` |
+
+- **Erster Start der neuen Version:** Eine `instrument_reader.db` im Startordner wird
+  einmalig in den Datenordner **kopiert**. Die alte Datei bleibt liegen.
+- **Backups** werden ausgedünnt: alle der letzten 24 Stunden (48 Stück), dann eins pro Tag für
+  30 Tage, danach eins pro Woche. Mit `INSTRUMENT_READER_BACKUP_MIRROR` oder `backup_mirror`
+  in `settings.json` geht jedes Backup zusätzlich in einen zweiten Ordner (z. B. OneDrive oder NAS).
+- **Fehlt die Datenbank beim Start oder enthält sie weniger als beim letzten Mal**, fragt die
+  App nach, statt leer weiterzumachen, und bietet das neueste Backup an.
+- **Aus dem Journal neu aufbauen:** `python scripts/rebuild_db.py` schreibt eine neue Datei
+  `instrument_reader_rebuilt_<Zeit>.db` in den Datenordner; die bestehende Datenbank wird nicht
+  angefasst. Das Journal enthält alles ab dem ersten Start dieser Version, ältere Daten stecken in
+  den Backups.
+- **Messen und Entwickeln trennen:** Gemessen wird aus einem Ordner, in dem während einer Messung
+  kein Git-Befehl läuft. Entwickelt wird in einem zweiten Klon oder Worktree mit eigenem
+  `INSTRUMENT_READER_DATA_DIR`.
 
 ## Kamera
 
@@ -58,7 +89,7 @@ Dienst für alle Kameras abstürzen lassen.
 
 ## Aufnahme
 
-*Record* speichert das Kamerabild in `recordings/recording_<Datum>_<Uhrzeit>.mkv`.
+*Record* speichert das Kamerabild in `recordings/recording_<Datum>_<Uhrzeit>.mkv` im Datenordner.
 MKV bleibt auch nach einem Absturz oder Stromausfall lesbar.
 
 Daneben liegt `<name>.timestamps.csv` mit der Aufnahmezeit jedes Bildes (etwa
@@ -108,5 +139,7 @@ Zeitmessung: `python scripts/benchmark_ocr.py`
 | `INSTRUMENT_READER_TESSDATA` | Ordner mit `*.traineddata` |
 | `INSTRUMENT_READER_OCR_BACKEND` | `auto` (Standard), `tesserocr` oder `cli` |
 | `INSTRUMENT_READER_CAMERA_HELPER` | `0`: Kamera ohne Hilfsprozess lesen |
+| `INSTRUMENT_READER_DATA_DIR` | Datenordner (Standard `%USERPROFILE%\InstrumentReader-Daten`) |
+| `INSTRUMENT_READER_BACKUP_MIRROR` | Zweiter Ordner für jede Datenbank-Sicherung |
 
 Änderungen stehen in [CHANGELOG.md](CHANGELOG.md).

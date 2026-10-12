@@ -55,9 +55,34 @@ class Database:
         ON readings(timestamp);
     """
 
-    def __init__(self, db_path: str = "instrument_reader.db"):
+    def __init__(self, db_path: str | None = None, journal: bool = True):
+        if db_path is None:
+            from instrument_reader.core.data_safety import db_path as default_db_path
+
+            default = default_db_path()
+            default.parent.mkdir(parents=True, exist_ok=True)
+            db_path = str(default)
         self.db_path = db_path
+        self._journal_enabled = journal
+        self._journal = None
         self._init_db()
+
+    @property
+    def journal(self):
+        """Append-only journal next to the database (follows db_path); None if disabled."""
+        if not self._journal_enabled:
+            return None
+        from instrument_reader.core.data_safety import journal_dir_for
+        from instrument_reader.core.journal import Journal
+
+        folder = journal_dir_for(self.db_path)
+        if self._journal is None or self._journal.folder != folder:
+            self._journal = Journal(folder)
+        return self._journal
+
+    def _log(self, event: str, **data) -> None:
+        if self.journal is not None:
+            self.journal.append(event, **data)
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -143,6 +168,7 @@ class Database:
             cursor.execute("DELETE FROM readings WHERE run_id = ?", (run_id,))
             cursor.execute("DELETE FROM runs WHERE id = ?", (run_id,))
             conn.commit()
+        self._log("delete_run", id=run_id)
 
     def delete_experiment(self, experiment_id: int):
         """Deletes an experiment, all its runs, and all associated readings."""
@@ -156,6 +182,7 @@ class Database:
             cursor.execute("DELETE FROM runs WHERE experiment_id = ?", (experiment_id,))
             cursor.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
             conn.commit()
+        self._log("delete_experiment", id=experiment_id)
 
     def get_run_readings_preview(self, run_id: int, limit: int = 100) -> List[Dict[str, Any]]:
         """Returns latest readings preview for a run."""

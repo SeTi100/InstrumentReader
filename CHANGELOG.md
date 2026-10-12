@@ -5,6 +5,21 @@ Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
 ## 2026-10-12
 
+### Datensicherheit
+- **Messdaten liegen außerhalb des Programmordners**, in `%USERPROFILE%\InstrumentReader-Daten\`
+  (`INSTRUMENT_READER_DATA_DIR`). Auslöser: Beim Wechsel auf einen alten `main`-Stand
+  hat Git die aus Git genommene Datenbank im Programmordner überschrieben, der folgende
+  `git pull` hat sie gelöscht. Die App startet nicht, wenn der Datenordner in einem Git-Ordner liegt.
+- Eine alte `instrument_reader.db` im Startordner wird beim ersten Start **kopiert**, nie verschoben.
+- **Nur anhängbares Journal** (`journal/JJJJ-MM-TT.jsonl`) aller Schreibvorgänge, vergangene
+  Tage schreibgeschützt; `scripts/rebuild_db.py` baut daraus die Datenbank neu auf.
+- **Automatische Backups** beim Start, nach jedem Run, alle 30 min und beim Schließen, ausgedünnt
+  nach Tag und Woche; optional zusätzlich in einen zweiten Ordner (`INSTRUMENT_READER_BACKUP_MIRROR`).
+- Fehlt die Datenbank beim Start oder enthält sie weniger als beim letzten Mal, fragt die App
+  nach und bietet das neueste Backup an.
+- Aufnahmen liegen ebenfalls im Datenordner. Der Fenstertitel zeigt, welcher Datenordner benutzt wird.
+- Tests benutzen immer einen eigenen temporären Datenordner.
+
 ### Kamera
 - **Live-Kameras laufen in einem eigenen Hilfsprozess.** Stürzt der Kameratreiber
   oder der Windows-Kameradienst (Frame Server) ab, stirbt nur der Hilfsprozess. Die
