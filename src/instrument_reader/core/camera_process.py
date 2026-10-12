@@ -1,27 +1,38 @@
-"""Reads a camera in a separate helper process.
+"""Reads a live camera in a separate helper process.
 
-When the Windows camera service (Frame Server) crashes, the Media Foundation state of
-the running process can stay broken: every reconnect fails until the app is restarted,
-even after unplugging the camera. A fresh process connects normally, so as a last
-resort the camera is read in one. ProcessCapture has the parts of cv2.VideoCapture's
-interface that OpenCVCamera uses. Ending the helper process also frees the device even
-when the driver hangs inside a read.
+When a camera driver or the Windows camera service (Frame Server) crashes, the process
+reading the camera can be left with broken Media Foundation state (every reconnect
+fails until restart) or even corrupted memory (Windows then kills the process, 0xc0000374).
+Reading the camera in a helper process confines both to the helper: it dies or fails,
+and the next reconnect simply starts a fresh one. Ending the helper also frees the
+device when the driver hangs inside a read.
+
+ProcessCapture has the parts of cv2.VideoCapture's interface that OpenCVCamera uses.
 """
 import multiprocessing as mp
 
 import numpy as np
 
-# The helper imports OpenCV and starts the device; that can take several seconds.
+# The helper starts Python, imports OpenCV and starts the device.
 START_TIMEOUT_S = 15.0
 READ_TIMEOUT_S = 2.0
 MAX_READ_FAILURES = 3
 
 
-def _capture_loop(source, api, conn, stop):
+def _capture_loop(source, api, name, other_backend, conn, stop):
     try:
         import cv2
 
-        cap = cv2.VideoCapture(source) if api is None else cv2.VideoCapture(source, api)
+        from instrument_reader.core.camera_devices import device_name, resolve_capture_target
+
+        target = resolve_capture_target(source, api, name, other_backend) if isinstance(source, int) else None
+        if other_backend and target is None:
+            conn.send(("failed", None))
+            return
+        if target is not None:
+            cap = cv2.VideoCapture(*target)
+        else:
+            cap = cv2.VideoCapture(source) if api is None else cv2.VideoCapture(source, api)
         if not cap.isOpened():
             conn.send(("failed", None))
             return
@@ -29,7 +40,12 @@ def _capture_loop(source, api, conn, stop):
             backend = cap.getBackendName()
         except cv2.error:
             backend = ""
-        conn.send(("opened", (float(cap.get(cv2.CAP_PROP_FPS) or 0.0), backend)))
+        if name is None and isinstance(source, int) and target is None:
+            try:
+                name = device_name(source, api if api is not None else getattr(cv2, f"CAP_{backend}", None))
+            except Exception:
+                name = None
+        conn.send(("opened", (float(cap.get(cv2.CAP_PROP_FPS) or 0.0), backend, name)))
         failures = 0
         while not stop.is_set():
             ok, frame = cap.read()
@@ -39,9 +55,13 @@ def _capture_loop(source, api, conn, stop):
                     break
                 continue
             failures = 0
-            conn.send(("frame", (frame.shape, frame.dtype.str, frame.tobytes())))
+            frame = np.ascontiguousarray(frame)
+            conn.send(("frame", (frame.shape, frame.dtype.str)))
+            # Flat byte view: for a 3-D array len() counts rows, not bytes, which breaks
+            # send_bytes on Windows pipes for frames larger than one write.
+            conn.send_bytes(memoryview(frame).cast("B"))
         cap.release()
-    except (EOFError, OSError, BrokenPipeError):
+    except (EOFError, OSError):
         pass
     finally:
         try:
@@ -51,16 +71,18 @@ def _capture_loop(source, api, conn, stop):
 
 
 class ProcessCapture:
-    def __init__(self, source: int, api: int | None = None):
+    def __init__(self, source: int | str, api: int | None = None, name: str | None = None,
+                 other_backend: bool = False):
         ctx = mp.get_context("spawn")
         self._conn, child_conn = ctx.Pipe(duplex=False)
         self._stop = ctx.Event()
         self._proc = ctx.Process(
-            target=_capture_loop, args=(source, api, child_conn, self._stop),
+            target=_capture_loop, args=(source, api, name, other_backend, child_conn, self._stop),
             name="camera-helper", daemon=True,
         )
         self._fps = 0.0
         self._backend = ""
+        self.device_name = name
         self._opened = False
         try:
             self._proc.start()
@@ -71,7 +93,7 @@ class ProcessCapture:
         child_conn.close()
         kind, payload = self._recv(START_TIMEOUT_S)
         if kind == "opened":
-            self._fps, self._backend = payload
+            self._fps, self._backend, self.device_name = payload
             self._opened = True
         else:
             self.release()
@@ -91,11 +113,17 @@ class ProcessCapture:
         if not self._opened:
             return False, None
         kind, payload = self._recv(READ_TIMEOUT_S)
-        if kind != "frame":
-            self._opened = False
-            return False, None
-        shape, dtype, data = payload
-        return True, np.frombuffer(data, dtype=np.dtype(dtype)).reshape(shape)
+        if kind == "frame":
+            shape, dtype = payload
+            dtype = np.dtype(dtype)
+            buf = bytearray(int(np.prod(shape)) * dtype.itemsize)
+            try:
+                self._conn.recv_bytes_into(buf)
+                return True, np.frombuffer(buf, dtype=dtype).reshape(shape)
+            except (EOFError, OSError):
+                pass
+        self._opened = False
+        return False, None
 
     def get(self, prop) -> float:
         import cv2

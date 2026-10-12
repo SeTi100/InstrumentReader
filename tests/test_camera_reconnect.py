@@ -223,6 +223,7 @@ def test_reconnect_keeps_backend(monkeypatch):
             pass
 
     monkeypatch.setattr(camera_mod.cv2, "VideoCapture", FakeCap)
+    monkeypatch.setattr(OpenCVCamera, "USE_HELPER_PROCESS", False)
     monkeypatch.setattr("sys.platform", "win32")
     cam = OpenCVCamera(1)
     assert cam._api is None
@@ -330,6 +331,7 @@ def test_encoded_index_opens_directshow_device(monkeypatch):
             pass
 
     monkeypatch.setattr(camera_mod.cv2, "VideoCapture", FakeCap)
+    monkeypatch.setattr(camera_mod.OpenCVCamera, "USE_HELPER_PROCESS", False)
     monkeypatch.setattr("sys.platform", "win32")
     cam = camera_mod.OpenCVCamera(701)
     assert cam.open() is False
@@ -412,7 +414,7 @@ def test_switches_route_when_reconnects_keep_failing(qtbot, fast_thread):
     assert device.open_handles == 0
 
 
-def test_next_route_cycles_and_skips_missing_backend(monkeypatch):
+def test_other_backend_found_by_name(monkeypatch):
     import cv2
     from instrument_reader.core import camera_devices
     from instrument_reader.core.camera import OpenCVCamera
@@ -427,36 +429,71 @@ def test_next_route_cycles_and_skips_missing_backend(monkeypatch):
         return None
 
     monkeypatch.setattr(camera_devices, "windows_device_index", fake_index)
-    cam = OpenCVCamera(0, cv2.CAP_MSMF)
-    assert cam._other_backend_target() == (1, cv2.CAP_DSHOW)  # found by name, not index
-    assert cam.name == "PC-LM1E Camera"
-    assert [cam.next_route() for _ in range(3)] == ["other", "process", "direct"]
-    assert cam.clone().route == "direct"
-
+    resolve = camera_devices.resolve_capture_target
+    assert resolve(0, cv2.CAP_MSMF, None, True) == (1, cv2.CAP_DSHOW)  # by name, not index
+    assert resolve(1, cv2.CAP_DSHOW, "PC-LM1E Camera", True) == (0, cv2.CAP_MSMF)
+    assert resolve(0, cv2.CAP_MSMF, None, False) is None
     lists[cv2.CAP_DSHOW] = {}
-    assert [cam.next_route() for _ in range(2)] == ["process", "direct"]
+    assert resolve(0, cv2.CAP_MSMF, None, True) is None
+
+    cam = OpenCVCamera(0, cv2.CAP_MSMF)
+    assert [cam.next_route() for _ in range(2)] == ["other", "direct"]
+    cam.next_route()
+    assert cam.clone().route == "other"
     assert OpenCVCamera("run.mp4").next_route() == "direct"
 
 
-def test_helper_process_capture_reads_frames(monkeypatch):
-    """The helper process delivers frames (from a video file standing in for a camera)."""
+def _clip(tmp_path, frames=5, size=(32, 24)):
+    import cv2
+
+    path = str(tmp_path / "clip.avi")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0, size)
+    for i in range(frames):
+        writer.write(np.full((size[1], size[0], 3), (i * 40) % 256, dtype=np.uint8))
+    writer.release()
+    return path
+
+
+def test_helper_process_capture_reads_frames(tmp_path):
+    """The helper process delivers writable frames (a video file stands in for a camera)."""
     import cv2
     from instrument_reader.core.camera_process import ProcessCapture
 
-    import tempfile, os
-    path = os.path.join(tempfile.mkdtemp(), "clip.avi")
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (32, 24))
-    for i in range(5):
-        writer.write(np.full((24, 32, 3), i * 40, dtype=np.uint8))
-    writer.release()
-
-    cap = ProcessCapture(path)
+    # Camera-sized frames: larger than one pipe write on Windows.
+    cap = ProcessCapture(_clip(tmp_path, frames=30, size=(640, 480)))
     try:
         assert cap.isOpened()
         assert cap.get(cv2.CAP_PROP_FPS) == 10.0
-        ok, frame = cap.read()
-        assert ok and frame.shape == (24, 32, 3)
+        for _ in range(30):
+            ok, frame = cap.read()
+            assert ok and frame.shape == (480, 640, 3)
+        frame[0, 0] = 255  # downstream code may draw on frames
     finally:
         cap.release()
     assert not cap._proc.is_alive()
-    assert ProcessCapture(os.path.join(os.path.dirname(path), "missing.avi")).isOpened() is False
+    assert ProcessCapture(str(tmp_path / "missing.avi")).isOpened() is False
+
+
+def test_helper_crash_only_ends_the_capture(tmp_path):
+    """A driver crash kills only the helper: the read fails and a new helper works."""
+    from instrument_reader.core.camera_process import ProcessCapture
+
+    path = _clip(tmp_path, frames=200)
+    cap = ProcessCapture(path)
+    assert cap.read()[0]
+    cap._proc.kill()
+    cap._proc.join(5)
+    results = [cap.read()[0] for _ in range(200)]
+    assert results[-1] is False
+    cap.release()
+
+    fresh = ProcessCapture(path)
+    assert fresh.read()[0]
+    fresh.release()
+
+
+def test_live_camera_uses_helper_process():
+    from instrument_reader.core.camera import OpenCVCamera
+
+    assert OpenCVCamera(0).uses_helper_process is OpenCVCamera.USE_HELPER_PROCESS
+    assert OpenCVCamera("run.mp4").uses_helper_process is False
