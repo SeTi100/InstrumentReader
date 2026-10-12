@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import shutil
 
 import cv2
 import numpy as np
@@ -98,3 +100,52 @@ def test_tesserocr_matches_cli():
     cli = [r.raw_text for r in TesseractEngine(backend="cli").recognize_many(images, cfg)]
     fast = [r.raw_text for r in TesseractEngine(backend="tesserocr").recognize_many(images, cfg)]
     assert fast == cli
+
+
+def test_normal_font_uses_eng_for_digit_slots():
+    worker = OCRWorker()
+    container = ROIConfig(name="Waage", is_container=True, decimal_position=1, ocr_font="normal",
+                          coordinates=[0, 0, 300, 100], sub_roi_ids=["S1", "S2"])
+    s1 = ROIConfig(name="S1", coordinates=[10, 10, 41, 70])
+    s2 = ROIConfig(name="S2", coordinates=[60, 10, 42, 70])
+    first = "--psm 8 -l eng -c tessedit_char_whitelist=0123456789-"
+    worker.engine = BatchRecordingEngine({first: {41: "4", 42: "6"}})
+
+    readings = worker.process_frame(np.zeros((200, 300, 3), np.uint8), [container, s1, s2])
+
+    assert worker.engine.batches == [(first, [41, 42])]
+    composite = next(r for r in readings if r["roi_name"] == "Waage")
+    assert composite["parsed_value"] == 4.6
+
+
+def test_standalone_rois_batched_per_font():
+    worker = OCRWorker()
+    seg = ROIConfig(name="Temp", coordinates=[0, 0, 41, 50])
+    normal = ROIConfig(name="Masse", coordinates=[100, 0, 42, 50], ocr_font="normal", decimal_places=2)
+    eng_cfg = "--psm 7 -l eng -c tessedit_char_whitelist=0123456789.-"
+    worker.engine = BatchRecordingEngine({None: {41: "215"}, eng_cfg: {42: "9668.46"}})
+    worker.engine.recognize_many = _parsing(worker.engine.recognize_many)
+
+    readings = {r["roi_name"]: r for r in worker.process_frame(np.zeros((100, 200, 3), np.uint8), [seg, normal])}
+
+    assert sorted(worker.engine.batches, key=str) == sorted([(None, [41]), (eng_cfg, [42])], key=str)
+    assert readings["Masse"]["parsed_value"] == pytest.approx(9668.46)
+    assert readings["Temp"]["parsed_value"] == 215
+
+
+def _parsing(recognize_many):
+    def wrapped(images, config=None):
+        return [ocr_engine._build_result([r.raw_text], [90.0]) for r in recognize_many(images, config)]
+    return wrapped
+
+
+@pytest.mark.skipif(not HAS_TESSERACT, reason="tesseract nicht installiert")
+def test_cli_works_without_tsv_config_file(tmp_path):
+    # tessdata-Ordner nur mit eng.traineddata, ohne configs/tsv
+    src = ocr_engine.resolve_tessdata_dir(None, resolve_tesseract_cmd())
+    if not src or not os.path.isfile(os.path.join(src, "eng.traineddata")):
+        pytest.skip("eng.traineddata nicht gefunden")
+    shutil.copy(os.path.join(src, "eng.traineddata"), tmp_path / "eng.traineddata")
+    engine = TesseractEngine(backend="cli", tessdata_dir=str(tmp_path))
+    res = engine.recognize(_digit_image("4"), "--psm 10 -l eng -c tessedit_char_whitelist=0123456789")
+    assert res.raw_text == "4"
