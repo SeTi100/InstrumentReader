@@ -1,11 +1,46 @@
 import os
 import queue
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 import cv2
 import numpy as np
+
+# Frame times are flushed to disk this often, so a crash loses at most this many.
+TIMESTAMP_FLUSH_EVERY = 30
+
+
+def timestamps_path(video_path: str | Path) -> Path:
+    """Sidecar file with the wall-clock time of every frame of a recording."""
+    p = Path(video_path)
+    return p.with_name(p.stem + ".timestamps.csv")
+
+
+def load_frame_times(video_path: str | Path) -> Optional[np.ndarray]:
+    """Epoch time of each frame (index = frame number), or None without a sidecar file."""
+    path = timestamps_path(video_path)
+    if not path.exists():
+        return None
+    times = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            next(f, None)  # header
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 2:
+                    try:
+                        times.append(float(parts[1]))
+                    except ValueError:
+                        break  # half-written last line after a crash
+    except OSError:
+        return None
+    return np.asarray(times, dtype=float) if times else None
+
+
+def _fourcc(fmt: str) -> int:
+    return cv2.VideoWriter_fourcc(*("mp4v" if fmt in ("mp4", "mkv") else "XVID"))
 
 
 class VideoRecorder:
@@ -13,23 +48,32 @@ class VideoRecorder:
     Lightweight video recorder decoupled from the GUI via an in-memory queue.
     Saves incoming frames into specified directory (default: recordings/)
     using OpenCV VideoWriter.
+
+    Default container is MKV: it is written progressively, so a crash or power loss
+    keeps everything up to the last moment. An MP4 only becomes readable when the
+    recording is stopped cleanly. Next to the video, <name>.timestamps.csv logs the
+    wall-clock time of every written frame, so frames lost while the camera was gone
+    (or dropped when the disk was too slow) do not shift the time axis on playback.
     """
 
     def __init__(
         self,
         output_dir: str | Path = "recordings",
         fps: float = 30.0,
-        format: str = "mp4",
+        format: str = "mkv",
     ):
         self.output_dir = Path(output_dir)
         self.fps = fps
         self.format = format.lower().lstrip(".")
         self.is_recording = False
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=300)
+        self._queue: queue.Queue[Optional[tuple[np.ndarray, float]]] = queue.Queue(maxsize=300)
         self._thread: Optional[threading.Thread] = None
         self._writer: Optional[cv2.VideoWriter] = None
+        self._size: Optional[Tuple[int, int]] = None
+        self._times = None
         self.current_file: Optional[str] = None
         self._frames_written = 0
+        self.frames_dropped = 0
 
     def start_recording(
         self,
@@ -60,18 +104,18 @@ class VideoRecorder:
         filepath = str(self.output_dir / filename)
         self.current_file = filepath
         self._frames_written = 0
-
-        fourcc = (
-            cv2.VideoWriter_fourcc(*"mp4v")
-            if self.format == "mp4"
-            else cv2.VideoWriter_fourcc(*"XVID")
-        )
+        self.frames_dropped = 0
+        fmt = Path(filepath).suffix.lower().lstrip(".") or self.format
 
         if frame_size:
             w, h = frame_size
-            self._writer = cv2.VideoWriter(filepath, fourcc, self.fps, (w, h))
+            self._size = (w, h)
+            self._writer = cv2.VideoWriter(filepath, _fourcc(fmt), self.fps, (w, h))
         else:
+            self._size = None
             self._writer = None  # Will be lazily initialized on first frame
+        self._times = open(timestamps_path(filepath), "w", encoding="utf-8", newline="\n")
+        self._times.write("frame,epoch_s\n")
 
         self.is_recording = True
 
@@ -82,21 +126,22 @@ class VideoRecorder:
             except queue.Empty:
                 break
 
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread = threading.Thread(target=self._worker, args=(fmt,), daemon=True)
         self._thread.start()
         return filepath
 
-    def write_frame(self, frame: Optional[np.ndarray]) -> bool:
+    def write_frame(self, frame: Optional[np.ndarray], timestamp: Optional[float] = None) -> bool:
         """
-        Pushes a copy of the frame into the write queue.
+        Pushes a copy of the frame (with its capture time, default: now) into the write queue.
         Non-blocking: if the queue is full, frame is dropped rather than blocking GUI.
         """
         if not self.is_recording or frame is None:
             return False
         try:
-            self._queue.put_nowait(frame.copy())
+            self._queue.put_nowait((frame.copy(), time.time() if timestamp is None else timestamp))
             return True
         except queue.Full:
+            self.frames_dropped += 1
             return False
 
     def stop_recording(self) -> Optional[str]:
@@ -114,20 +159,26 @@ class VideoRecorder:
             if not self._thread.is_alive():
                 self._thread = None
 
-        if self._writer and (not self._thread or not self._thread.is_alive()):
-            self._writer.release()
-            self._writer = None
+        if not self._thread or not self._thread.is_alive():
+            if self._writer:
+                self._writer.release()
+                self._writer = None
+            self._close_times()
 
         saved = self.current_file
         self.current_file = None
         return saved
 
-    def _worker(self):
-        fourcc = (
-            cv2.VideoWriter_fourcc(*"mp4v")
-            if self.format == "mp4"
-            else cv2.VideoWriter_fourcc(*"XVID")
-        )
+    def _close_times(self):
+        times, self._times = self._times, None
+        if times is not None:
+            try:
+                times.close()
+            except OSError:
+                pass
+
+    def _worker(self, fmt: str):
+        fourcc = _fourcc(fmt)
         try:
             while True:
                 try:
@@ -141,19 +192,29 @@ class VideoRecorder:
                     self._queue.task_done()
                     break
 
-                frame = item
+                frame, ts = item
                 try:
                     if len(frame.shape) == 2:
                         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
                     if self._writer is None and self.current_file:
                         h, w = frame.shape[:2]
+                        self._size = (w, h)
                         self._writer = cv2.VideoWriter(
                             self.current_file, fourcc, self.fps, (w, h)
                         )
 
+                    if self._size and frame.shape[1::-1] != self._size:
+                        # VideoWriter silently skips frames of another size, which would
+                        # put the timestamp log out of step with the video.
+                        frame = cv2.resize(frame, self._size)
+
                     if self._writer and self._writer.isOpened():
                         self._writer.write(frame)
+                        if self._times is not None:
+                            self._times.write(f"{self._frames_written},{ts:.3f}\n")
+                            if self._frames_written % TIMESTAMP_FLUSH_EVERY == 0:
+                                self._times.flush()
                         self._frames_written += 1
                 finally:
                     self._queue.task_done()
@@ -161,3 +222,4 @@ class VideoRecorder:
             if self._writer:
                 self._writer.release()
                 self._writer = None
+            self._close_times()

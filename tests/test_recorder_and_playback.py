@@ -457,3 +457,91 @@ def test_camera_source_polymorphic_defaults():
     assert dummy.seek_to_frame(5) is False
 
 
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe recording and per-frame timestamps
+# ---------------------------------------------------------------------------
+
+def test_recorder_defaults_to_mkv_and_logs_frame_times(tmp_path):
+    from instrument_reader.core.recorder import load_frame_times, timestamps_path
+
+    rec = VideoRecorder(output_dir=tmp_path, fps=10.0)
+    path = rec.start_recording()
+    assert path.endswith(".mkv")
+    for i in range(20):
+        # 10 frames, then a 60 s gap (camera gone), then 10 more
+        assert rec.write_frame(np.full((48, 64, 3), i * 10, dtype=np.uint8), timestamp=1000.0 + i * 0.1 + (60 if i >= 10 else 0))
+    rec.stop_recording()
+
+    assert timestamps_path(path).name == Path(path).stem + ".timestamps.csv"
+    times = load_frame_times(path)
+    assert len(times) == 20
+    assert times[9] == pytest.approx(1000.9) and times[10] == pytest.approx(1061.0)
+
+    # Playback keeps the gap instead of squeezing it out of the time axis.
+    cam = OpenCVCamera(path)
+    assert cam.open()
+    stamps = []
+    while True:
+        ok, _ = cam.read()
+        if not ok:
+            break
+        stamps.append(cam.frame_timestamp())
+    cam.release()
+    assert len(stamps) == 20
+    assert stamps[0] == pytest.approx(1000.0)
+    assert stamps[10] - stamps[9] == pytest.approx(60.1)
+
+
+def test_recorder_resizes_frames_of_another_size(tmp_path):
+    from instrument_reader.core.recorder import load_frame_times
+
+    rec = VideoRecorder(output_dir=tmp_path, fps=10.0)
+    path = rec.start_recording()
+    rec.write_frame(np.zeros((48, 64, 3), dtype=np.uint8))
+    rec.write_frame(np.zeros((96, 128, 3), dtype=np.uint8))  # camera came back at another size
+    rec.stop_recording()
+    cap = cv2.VideoCapture(path)
+    frames = sum(1 for _ in range(5) if cap.read()[0])
+    cap.release()
+    assert frames == 2 == len(load_frame_times(path))
+
+
+_CRASH_WRITER = """
+import sys, time
+import numpy as np
+from instrument_reader.core.recorder import VideoRecorder
+rec = VideoRecorder(output_dir=sys.argv[1], fps=30.0)
+print(rec.start_recording(), flush=True)
+i = 0
+while True:
+    rec.write_frame(np.random.randint(0, 255, (240, 320, 3), dtype=np.uint8))
+    i += 1
+    time.sleep(1 / 30)
+"""
+
+
+def test_recording_survives_hard_crash(tmp_path):
+    """A killed process (crash, power loss) leaves a readable video and frame times."""
+    import subprocess
+    import sys
+
+    from instrument_reader.core.recorder import load_frame_times
+
+    proc = subprocess.Popen([sys.executable, "-c", _CRASH_WRITER, str(tmp_path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    path = proc.stdout.readline().strip()
+    time.sleep(4)
+    proc.kill()
+    proc.wait()
+
+    cap = cv2.VideoCapture(path)
+    assert cap.isOpened()
+    frames = 0
+    while cap.read()[0]:
+        frames += 1
+    cap.release()
+    assert frames > 30
+    times = load_frame_times(path)
+    assert times is not None and len(times) >= frames - 30

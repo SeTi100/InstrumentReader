@@ -82,6 +82,7 @@ class OpenCVCamera(CameraSource):
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
         self._start_epoch: float | None = None
+        self._frame_times: np.ndarray | None = None
         # None: OpenCV picks the backend on the first open (Media Foundation first on
         # Windows, then DirectShow, so typed indices reach DirectShow-only virtual cameras
         # too). open() then records the backend that worked, and clone() passes it on, so
@@ -171,6 +172,9 @@ class OpenCVCamera(CameraSource):
         val = cap.get(cv2.CAP_PROP_FPS)
         self._cached_fps = float(val) if val and val > 0 else 30.0
         if self.is_video_file:
+            from instrument_reader.core.recorder import load_frame_times
+
+            self._frame_times = load_frame_times(self._source)
             self._start_epoch = self._guess_start_epoch()
         return True
 
@@ -273,12 +277,21 @@ class OpenCVCamera(CameraSource):
     def frame_timestamp(self) -> float:
         """
         Epoch timestamp (seconds) of the frame returned by the last read().
-        Live cameras use wall-clock time; video files use the recording start
-        plus the frame's position in the video, so offline analysis yields the
-        same time axis as the original recording, independent of playback speed.
+        Live cameras use wall-clock time. Video files use the time logged for the
+        frame while recording (<name>.timestamps.csv), so gaps where frames are
+        missing keep their real length; without that file, the recording start
+        plus the frame's position in the video. Either way offline analysis yields
+        the same time axis as the original recording, independent of playback speed.
         """
         if not self.is_video_file:
             return time.time()
+        if self._frame_times is not None and self._cap is not None:
+            pos = int(round(self._cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1
+            times = self._frame_times
+            if 0 <= pos < len(times):
+                return float(times[pos])
+            if pos >= len(times):
+                return float(times[-1]) + (pos - len(times) + 1) / self.fps
         if self._start_epoch is None:
             self._start_epoch = self._guess_start_epoch()
         return self._start_epoch + self.get_position_seconds()
@@ -289,6 +302,8 @@ class OpenCVCamera(CameraSource):
         a YYYYMMDD_HHMMSS stamp in the file name (as written by VideoRecorder),
         otherwise the file modification time minus the video duration.
         """
+        if self._frame_times is not None and len(self._frame_times):
+            return float(self._frame_times[0])
         name = os.path.basename(str(self._source))
         m = re.search(r"(\d{8}_\d{6})", name)
         if m:
