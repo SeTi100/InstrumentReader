@@ -74,12 +74,11 @@ class CameraThread(QThread):
     STALL_TIMEOUT_S = 1.5
     # Opening a device can legitimately take a few seconds (driver start-up).
     OPEN_TIMEOUT_S = 8.0
-    # A helper process first has to start Python and import OpenCV.
+    # A camera helper process first has to start Python and import OpenCV.
     HELPER_OPEN_TIMEOUT_S = 20.0
     # Delay before each reconnect attempt; the last value repeats.
     RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
-    # Failed attempts before the camera is tried another way (other backend, helper
-    # process), so a broken connection inside this process cannot block it for good.
+    # Failed attempts before the camera is tried through the other Windows backend.
     ROUTE_SWITCH_AFTER = 3
     STOP_JOIN_TIMEOUT_S = 1.0
     # Max. rate of GUI frame updates while a video runs unpaced
@@ -257,7 +256,7 @@ class CameraThread(QThread):
                         self._set_state("connected", f"Kamera verbunden ({note})" if note else "Kamera verbunden")
                     stalled = now - session.last_frame_at > self.STALL_TIMEOUT_S
                 else:
-                    helper = getattr(session.camera, "route", None) == "process"
+                    helper = getattr(session.camera, "uses_helper_process", False)
                     timeout = self.HELPER_OPEN_TIMEOUT_S if helper else self.OPEN_TIMEOUT_S
                     stalled = now - session.started_at > timeout
 

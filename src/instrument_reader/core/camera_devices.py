@@ -98,6 +98,34 @@ def windows_device_index(api: int, name: str | None = None, index: int | None = 
     return None
 
 
+def device_name(index: int, api: int | None) -> str | None:
+    """Name of the Windows camera at this index of the backend's list (None: unknown)."""
+    import cv2
+
+    if not sys.platform.startswith("win"):
+        return None
+    found = windows_device_index(cv2.CAP_MSMF if api is None else api, index=index)
+    return None if found is None else found[1]
+
+
+def resolve_capture_target(index: int, api: int | None, name: str | None, other_backend: bool) -> tuple[int, int] | None:
+    """(index, backend) of the camera in the other Windows backend's list, found by name
+    (indices differ between the lists); None if that does not apply or it is not listed."""
+    import cv2
+
+    if not other_backend or not sys.platform.startswith("win"):
+        return None
+    api = cv2.CAP_MSMF if api is None else api
+    if api not in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
+        return None
+    name = name or device_name(index, api)
+    if name is None:
+        return None
+    other = cv2.CAP_DSHOW if api == cv2.CAP_MSMF else cv2.CAP_MSMF
+    found = windows_device_index(other, name=name)
+    return None if found is None else (found[0], other)
+
+
 def list_cameras() -> list[CameraDevice] | None:
     """Returns the cameras currently attached ([] if none), or None if they cannot be listed."""
     sources = [_from_qt]
