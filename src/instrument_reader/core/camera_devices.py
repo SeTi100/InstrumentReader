@@ -83,6 +83,21 @@ def _from_windows() -> list[CameraDevice]:
     return devices
 
 
+def windows_device_index(api: int, name: str | None = None, index: int | None = None) -> tuple[int, str] | None:
+    """(index, name) of a camera in one Windows backend's device list, found by name or,
+    without a name, by index; None if it is not listed or the list is unavailable."""
+    try:
+        from cv2_enumerate_cameras import enumerate_cameras
+
+        cams = enumerate_cameras(api)
+    except Exception:
+        return None
+    for c in cams:
+        if (name is not None and c.name == name) or (name is None and c.index == index):
+            return c.index, c.name
+    return None
+
+
 def list_cameras() -> list[CameraDevice] | None:
     """Returns the cameras currently attached ([] if none), or None if they cannot be listed."""
     sources = [_from_qt]

@@ -74,8 +74,13 @@ class CameraThread(QThread):
     STALL_TIMEOUT_S = 1.5
     # Opening a device can legitimately take a few seconds (driver start-up).
     OPEN_TIMEOUT_S = 8.0
+    # A helper process first has to start Python and import OpenCV.
+    HELPER_OPEN_TIMEOUT_S = 20.0
     # Delay before each reconnect attempt; the last value repeats.
     RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
+    # Failed attempts before the camera is tried another way (other backend, helper
+    # process), so a broken connection inside this process cannot block it for good.
+    ROUTE_SWITCH_AFTER = 3
     STOP_JOIN_TIMEOUT_S = 1.0
     # Max. rate of GUI frame updates while a video runs unpaced
     DISPLAY_INTERVAL_S = 1.0 / 30.0
@@ -233,6 +238,8 @@ class CameraThread(QThread):
                     self._sleep(delay)
                     if not self.running:
                         break
+                    if attempt and attempt % self.ROUTE_SWITCH_AFTER == 0 and hasattr(self.camera, "next_route"):
+                        self.camera.next_route()
                     attempt += 1
                     session = _LiveSession(self.camera.clone(), self._emit_frame)
                     session.start()
@@ -246,10 +253,13 @@ class CameraThread(QThread):
                             self.camera.adopt(session.camera)
                         attempt = 0
                         ever_connected = True
-                        self._set_state("connected", "Kamera verbunden")
+                        note = getattr(session.camera, "route_label", "")
+                        self._set_state("connected", f"Kamera verbunden ({note})" if note else "Kamera verbunden")
                     stalled = now - session.last_frame_at > self.STALL_TIMEOUT_S
                 else:
-                    stalled = now - session.started_at > self.OPEN_TIMEOUT_S
+                    helper = getattr(session.camera, "route", None) == "process"
+                    timeout = self.HELPER_OPEN_TIMEOUT_S if helper else self.OPEN_TIMEOUT_S
+                    stalled = now - session.started_at > timeout
 
                 if session.done or stalled:
                     # Stop the old session (it releases its handle as soon as the driver

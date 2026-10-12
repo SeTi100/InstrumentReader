@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 from datetime import datetime
 
@@ -62,8 +63,16 @@ def _is_plain_index(source) -> bool:
     return isinstance(source, int) and 0 <= source < 100
 
 
+# Ways to reach a live camera, tried in turn while reconnects keep failing (see
+# OpenCVCamera.next_route()).
+ROUTE_DIRECT = "direct"            # the selected index and backend, in this process
+ROUTE_OTHER_BACKEND = "other"      # same camera (by name) via the other Windows backend
+ROUTE_HELPER_PROCESS = "process"   # the selected index and backend, in a fresh process
+ROUTES = (ROUTE_DIRECT, ROUTE_OTHER_BACKEND, ROUTE_HELPER_PROCESS)
+
+
 class OpenCVCamera(CameraSource):
-    def __init__(self, source: int | str = 0, api_preference: int | None = None):
+    def __init__(self, source: int | str = 0, api_preference: int | None = None, name: str | None = None):
         self._source = source
         self._cap: cv2.VideoCapture | None = None
         self._cached_fps: float | None = None
@@ -74,6 +83,9 @@ class OpenCVCamera(CameraSource):
         # a reconnect can never fall through to another backend's device list (where
         # index 0 may be a virtual placeholder camera such as OBS).
         self._api = api_preference
+        # Device name, used to find the same camera in the other backend's list.
+        self.name = name
+        self.route = ROUTE_DIRECT
 
     @property
     def source(self) -> int | str:
@@ -84,29 +96,88 @@ class OpenCVCamera(CameraSource):
         self._source = source
 
     def adopt(self, other: "OpenCVCamera") -> None:
-        """Takes over the backend and frame rate a reconnected clone ended up with."""
+        """Takes over the backend, route and frame rate a reconnected clone ended up with."""
         self._api = other._api
+        self.name = other.name
+        self.route = other.route
         self._cached_fps = other.fps
 
     def clone(self) -> "OpenCVCamera":
         """Returns an unopened camera for the same device and backend (used for reconnects)."""
-        return type(self)(self._source, self._api)
+        twin = type(self)(self._source, self._api, self.name)
+        twin.route = self.route
+        return twin
+
+    def next_route(self) -> str:
+        """Switches to the next way of reaching this camera; takes effect on the next open().
+
+        Reconnecting the same way can keep failing after the Windows camera service
+        crashed, until the app restarts. The other backend or a fresh helper process
+        then still reaches the camera. Video files have only the direct route.
+        """
+        if self.is_video_file or not isinstance(self._source, int):
+            return self.route
+        i = ROUTES.index(self.route)
+        for step in range(1, len(ROUTES) + 1):
+            route = ROUTES[(i + step) % len(ROUTES)]
+            if route != ROUTE_OTHER_BACKEND or self._other_backend_target() is not None:
+                self.route = route
+                break
+        return self.route
+
+    @property
+    def route_label(self) -> str:
+        """Short note for the status line when the camera is not reached the usual way."""
+        return {
+            ROUTE_OTHER_BACKEND: "Ersatzweg: anderer Kameratreiber",
+            ROUTE_HELPER_PROCESS: "Ersatzweg: Hilfsprozess",
+        }.get(self.route, "")
+
+    def _backend(self) -> tuple[int, int | None]:
+        """(device index, backend) the direct route opens."""
+        if isinstance(self._source, int) and not _is_plain_index(self._source):
+            # OpenCV's encoded form: 701 = device 1 of backend 700 (DirectShow).
+            return self._source % 100, self._source - self._source % 100
+        return self._source, self._api
+
+    def _other_backend_target(self) -> tuple[int, int] | None:
+        """(index, backend) of this camera in the other Windows backend's device list."""
+        if not sys.platform.startswith("win") or not isinstance(self._source, int):
+            return None
+        from instrument_reader.core.camera_devices import windows_device_index
+
+        index, api = self._backend()
+        api = cv2.CAP_MSMF if api is None else api
+        if api not in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
+            return None
+        other = cv2.CAP_DSHOW if api == cv2.CAP_MSMF else cv2.CAP_MSMF
+        if self.name is None:
+            found = windows_device_index(api, index=index)
+            if found is None:
+                return None
+            self.name = found[1]
+        found = windows_device_index(other, name=self.name)
+        return None if found is None else (found[0], other)
 
     def open(self) -> bool:
         # Never leave a stale handle behind: a capture that is not released keeps
         # the device locked for other applications (e.g. OBS) until the process exits.
         self.release()
-        if isinstance(self._source, int) and not _is_plain_index(self._source):
-            # OpenCV's encoded form: 701 = device 1 of backend 700 (DirectShow).
-            cap = cv2.VideoCapture(self._source % 100, self._source - self._source % 100)
-        elif self._api is None:
-            cap = cv2.VideoCapture(self._source)
+        index, api = self._backend()
+        if self.route == ROUTE_OTHER_BACKEND and (target := self._other_backend_target()):
+            cap = cv2.VideoCapture(*target)
+        elif self.route == ROUTE_HELPER_PROCESS and isinstance(index, int):
+            from instrument_reader.core.camera_process import ProcessCapture
+
+            cap = ProcessCapture(index, api)
+        elif api is None:
+            cap = cv2.VideoCapture(index)
         else:
-            cap = cv2.VideoCapture(self._source, self._api)
+            cap = cv2.VideoCapture(index, api)
         if not cap.isOpened():
             cap.release()
             return False
-        if self._api is None and _is_plain_index(self._source):
+        if self._api is None and _is_plain_index(self._source) and self.route == ROUTE_DIRECT:
             # Reconnects must use the same backend, or a different device list applies.
             try:
                 self._api = _backend_id(cap.getBackendName())
