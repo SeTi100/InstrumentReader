@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from typing import Optional, List, Dict, Set, Tuple
 from PySide6.QtCore import QThread, Signal
-from instrument_reader.core.ocr_engine import TesseractEngine, OCRResult
+from instrument_reader.core.ocr_engine import TesseractEngine, OCRResult, line_config, digit_slot_configs
 from instrument_reader.core.preprocessing import PreprocessingPipeline, PreprocessingConfig
 from instrument_reader.core.validator import ValueValidator
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -410,9 +410,8 @@ class OCRWorker(QThread):
                     # Fallback chain: each pass only re-runs the slots that found nothing yet
                     results: Dict[int, OCRResult] = {}
                     pending = list(range(len(slots)))
-                    for ocr_cfg in (f"--psm 10 -l lets -c tessedit_char_whitelist={whitelist}",
-                                    f"--psm 10 -c tessedit_char_whitelist={whitelist}",
-                                    None):
+                    font = getattr(container, "ocr_font", "seven_segment")
+                    for ocr_cfg in digit_slot_configs(font, whitelist):
                         if not pending:
                             break
                         batch = self._recognize_many([slots[i][2] for i in pending], ocr_cfg)
@@ -563,7 +562,15 @@ class OCRWorker(QThread):
             except Exception as e:
                 print(f"OCR Error for {roi.name}: {e}")
 
-        ocr_results = self._recognize_many([img for _, img in prepared], None) if prepared else []
+        # One batch per OCR config (model depends on the ROI's font)
+        ocr_results: List[Optional[OCRResult]] = [None] * len(prepared)
+        by_config: Dict[Optional[str], List[int]] = {}
+        for i, (roi, _) in enumerate(prepared):
+            cfg = line_config(getattr(roi, "ocr_font", "seven_segment"), getattr(roi, "allow_negative", True))
+            by_config.setdefault(cfg, []).append(i)
+        for cfg, idxs in by_config.items():
+            for i, res in zip(idxs, self._recognize_many([prepared[i][1] for i in idxs], cfg)):
+                ocr_results[i] = res
         for (roi, _), ocr_res in zip(prepared, ocr_results):
             try:
                 roi_key = getattr(roi, "id", roi.name)

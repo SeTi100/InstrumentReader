@@ -6,6 +6,10 @@ Die App braucht ein installiertes [Tesseract](https://github.com/tesseract-ocr/t
 (Windows: z. B. der UB-Mannheim-Installer) und für Sieben-Segment-Anzeigen das
 Sprachmodell `lets.traineddata` im `tessdata`-Ordner.
 
+Pro ROI lässt sich im ROI-Dialog unter „Schriftart (OCR)" wählen, welches Modell
+benutzt wird: „7-Segment / LCD" nimmt `lets`, „Normale Schrift" (z. B. Waagen mit
+normalen Ziffern) nimmt `eng`. `lets` verliest normale Ziffern, etwa eine 4 als 0 oder 1.
+
 Tesseract wird in dieser Reihenfolge gesucht:
 
 1. Umgebungsvariable `INSTRUMENT_READER_TESSERACT` (voller Pfad zu `tesseract`/`tesseract.exe`)

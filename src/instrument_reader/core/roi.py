@@ -38,6 +38,7 @@ class ROIConfig:
     decimal_position: Optional[int] = None # Nach welcher Ziffer das Komma sitzt (1-basiert)
     allow_leading_blank: bool = True       # Unlit / blank leading digits allowed (e.g. '  15.4')
     allow_negative: bool = True            # Minus sign / negative numbers allowed
+    ocr_font: str = "seven_segment"        # "seven_segment" (Modell lets) oder "normal" (Modell eng)
     # Analoge Rotameter / Skalen-Kalibrierung: [[y_rel_or_px, value], ...]
     analog_calibration: list[list[float]] = field(default_factory=list)
     analog_value: Optional[float] = None   # Wenn diese ROI als Kalibriermarke dient

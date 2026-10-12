@@ -20,6 +20,35 @@ ENV_OCR_BACKEND = "INSTRUMENT_READER_OCR_BACKEND"       # auto | tesserocr | cli
 
 WINDOWS_DEFAULT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+# Schriftart der Anzeige (ROIConfig.ocr_font) -> passendes Tesseract-Modell
+OCR_FONT_SEVEN_SEGMENT = "seven_segment"   # 7-Segment/LCD: Modell "lets"
+OCR_FONT_NORMAL = "normal"                 # normale Ziffern (z. B. Waagen-Display): Modell "eng"
+DEFAULT_CONFIG = "--psm 7 -l lets -c tessedit_char_whitelist=0123456789.-"
+
+
+def line_config(font: str, allow_negative: bool = True) -> str | None:
+    """Config für eine ganze Zahlenzeile (Standalone-ROI); None = Engine-Standard (lets)."""
+    if font != OCR_FONT_NORMAL:
+        return None
+    whitelist = "0123456789.-" if allow_negative else "0123456789."
+    return f"--psm 7 -l eng -c tessedit_char_whitelist={whitelist}"
+
+
+def digit_slot_configs(font: str, whitelist: str) -> tuple[str | None, ...]:
+    """Fallback-Kette für einzelne Ziffern-Slots eines Containers.
+
+    Das 7-Segment-Modell "lets" verliest normale Ziffern (z. B. 4 -> 1/0, 46 -> 616),
+    daher für normale Schrift "eng". "eng" erkennt einzelne Ziffern mit --psm 10
+    unzuverlässig, mit --psm 8/13 dagegen sicher.
+    """
+    if font == OCR_FONT_NORMAL:
+        return (f"--psm 8 -l eng -c tessedit_char_whitelist={whitelist}",
+                f"--psm 13 -l eng -c tessedit_char_whitelist={whitelist}",
+                f"--psm 10 -l eng -c tessedit_char_whitelist={whitelist}")
+    return (f"--psm 10 -l lets -c tessedit_char_whitelist={whitelist}",
+            f"--psm 10 -c tessedit_char_whitelist={whitelist}",
+            None)
+
 
 @dataclass
 class OCRResult:
@@ -122,7 +151,7 @@ class TesseractEngine(OCREngine):
     ``auto`` (Standard) nimmt ``tesserocr``, wenn installiert, sonst ``cli``.
     """
 
-    def __init__(self, config: str = "--psm 7 -l lets -c tessedit_char_whitelist=0123456789.-",
+    def __init__(self, config: str = DEFAULT_CONFIG,
                  tesseract_cmd: str | None = None, tessdata_dir: str | None = None,
                  backend: str | None = None):
         self._config = config
@@ -188,7 +217,9 @@ class TesseractEngine(OCREngine):
             cmd = [self.tesseract_cmd, source, "stdout"]
             if self.tessdata_dir:
                 cmd += ["--tessdata-dir", self.tessdata_dir]
-            cmd += shlex.split(cfg, posix=not sys.platform.startswith("win")) + ["tsv"]
+            # tessedit_create_tsv statt der Config-Datei "tsv": die fehlt in tessdata-Ordnern
+            # ohne configs/ und Tesseract liefert dann stillschweigend keinen Text
+            cmd += shlex.split(cfg, posix=not sys.platform.startswith("win")) + ["-c", "tessedit_create_tsv=1"]
             proc = subprocess.run(
                 cmd, capture_output=True, timeout=30,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

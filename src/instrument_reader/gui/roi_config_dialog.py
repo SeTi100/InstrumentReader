@@ -30,6 +30,13 @@ class ROIConfigDialog(QDialog):
         else:
             self.type_combo.setCurrentText(roi.display_type.value)
         
+        self.font_combo = QComboBox()
+        self.font_combo.addItem("7-Segment / LCD", "seven_segment")
+        self.font_combo.addItem("Normale Schrift", "normal")
+        self.font_combo.setToolTip("Bestimmt das Tesseract-Modell: 7-Segment = lets, normale Ziffern = eng")
+        f_idx = self.font_combo.findData(getattr(roi, "ocr_font", "seven_segment"))
+        self.font_combo.setCurrentIndex(max(0, f_idx))
+
         self.unit_edit = QLineEdit(roi.unit)
         
         self.min_edit = QDoubleSpinBox()
@@ -56,6 +63,8 @@ class ROIConfigDialog(QDialog):
 
         form.addRow("Name:", self.name_edit)
         form.addRow("Display Type:", self.type_combo)
+        if roi.shape != ROIShape.RULER:
+            form.addRow("Schriftart (OCR):", self.font_combo)
         form.addRow("Unit:", self.unit_edit)
         form.addRow("Min Value:", self.min_edit)
         form.addRow("Max Value:", self.max_edit)
@@ -302,6 +311,7 @@ class ROIConfigDialog(QDialog):
             self.roi.decimal_position = self.decimal_pos_spin.value() if self.decimal_pos_spin.value() > 0 else None
             self.roi.allow_leading_blank = self.allow_blank_cb.isChecked()
             self.roi.allow_negative = self.allow_neg_cb.isChecked()
+            self.roi.ocr_font = self.font_combo.currentData()
 
             if self.sub_roi_list is not None:
                 selected_sub_ids = []
