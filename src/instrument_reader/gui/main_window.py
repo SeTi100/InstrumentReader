@@ -157,6 +157,8 @@ class MainWindow(QMainWindow):
         self.control_panel.speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
         self.control_panel.new_exp_btn.clicked.connect(self.create_experiment)
         self.control_panel.new_run_btn.clicked.connect(self.create_new_run)
+        self.control_panel.end_run_btn.clicked.connect(self.end_current_run)
+        self.control_panel.end_exp_btn.clicked.connect(self.end_current_experiment)
         self.control_panel.dashboard_btn.clicked.connect(self.open_runs_dashboard)
         self.control_panel.delete_roi_btn.clicked.connect(self.delete_roi)
         
@@ -475,6 +477,7 @@ class MainWindow(QMainWindow):
             self.current_experiment_id = exp_id
             self.current_experiment_name = data["exp_name"]
             self.control_panel.exp_label.setText(f"Experiment: {data['exp_name']} (ID: {exp_id}) | Run: {run_id}")
+            self._update_run_ui()
             self.calc_engine.reset_scale_detector(hard=True)
             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
             self.db_writer.set_phase("STAGE_1")
@@ -512,6 +515,7 @@ class MainWindow(QMainWindow):
             self.control_panel.exp_label.setText(
                 f"Experiment: {self.current_experiment_name} (ID: {self.current_experiment_id}) | Run: {run_id}"
             )
+            self._update_run_ui()
             self.calc_engine.reset_scale_detector(hard=True)
             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
             self.db_writer.set_phase("STAGE_1")
@@ -527,6 +531,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def set_active_run(self, run_id: int, exp_id: int, exp_name: str, parameters: Optional[dict] = None):
+        exp = self.db_writer.db.get_experiment(exp_id)
+        if exp is not None and exp.get("status") == "closed":
+            self.db_writer.reopen_experiment(exp_id)
         self.db_writer.set_active_run(run_id)
         self.current_experiment_id = exp_id
         self.current_experiment_name = exp_name
@@ -543,6 +550,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.control_panel.exp_label.setText(f"Experiment: {exp_name} (ID: {exp_id}) | Run: {run_id}")
+        self._update_run_ui()
         self.calc_engine.reset_scale_detector(hard=True)
         self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
         self.db_writer.set_phase("STAGE_1")
@@ -554,6 +562,49 @@ class MainWindow(QMainWindow):
         self.last_run_parameters = {}
         self.control_panel.exp_label.setText("Experiment: None | Run: None")
         self.control_panel.set_stage_status(1, "Inaktiv", inactive=True)
+        self.db_writer.set_phase("IDLE")
+        self._update_run_ui()
+
+    def _update_run_ui(self):
+        self.control_panel.set_run_state(
+            experiment_open=self.current_experiment_id is not None,
+            run_active=self.db_writer.current_run_id is not None,
+        )
+
+    def end_current_run(self, confirm: bool = True):
+        """Stops logging into the current run; the experiment stays open for a new run.
+        Camera, OCR and a running video recording keep going."""
+        run_id = self.db_writer.current_run_id
+        if run_id is None:
+            return
+        if confirm and QMessageBox.question(
+            self, "Run beenden",
+            f"Run {run_id} beenden?\n\nAb dann werden keine Messwerte mehr gespeichert. "
+            "Kamera und Videoaufnahme laufen weiter. Ein beendeter Run kann im Runs Dashboard fortgesetzt werden.",
+        ) != QMessageBox.Yes:
+            return
+        self.db_writer.end_run("stop")
+        self.control_panel.exp_label.setText(
+            f"Experiment: {self.current_experiment_name} (ID: {self.current_experiment_id}) | Run: – (Run {run_id} beendet)")
+        self.control_panel.set_stage_status(1, "Inaktiv", inactive=True)
+        self.db_writer.set_phase("IDLE")
+        self._update_run_ui()
+
+    def end_current_experiment(self, confirm: bool = True):
+        """Ends the running run and closes the experiment."""
+        exp_id = self.current_experiment_id
+        if exp_id is None:
+            return
+        run_note = f" und Run {self.db_writer.current_run_id}" if self.db_writer.current_run_id else ""
+        if confirm and QMessageBox.question(
+            self, "Experiment beenden",
+            f"Experiment '{self.current_experiment_name}'{run_note} beenden?\n\n"
+            "Danach sind keine neuen Runs in diesem Experiment mehr möglich, außer du setzt einen Run "
+            "im Runs Dashboard fort.",
+        ) != QMessageBox.Yes:
+            return
+        self.db_writer.end_experiment(exp_id)
+        self.clear_active_run()
             
     def on_readings_ready(self, readings, timestamp=None):
         self.control_panel.update_readings(readings)
@@ -865,7 +916,7 @@ class MainWindow(QMainWindow):
             self.camera_thread = None
             self.camera = None
         self.ocr_worker.stop()
-        self.db_writer.end_run()
+        self.db_writer.end_run("app_closed")
         self._backup_timer.stop()
         self.backup_database("close")
         event.accept()

@@ -837,6 +837,21 @@ class ControlPanel(QWidget):
         btn_row.addWidget(self.dashboard_btn)
         exp_layout.addLayout(btn_row)
 
+        # Separate row and wording from the camera's "Stop / Pause": these end data logging.
+        end_row = QHBoxLayout()
+        self.end_run_btn = QPushButton("■ Run beenden")
+        self.end_exp_btn = QPushButton("Experiment beenden")
+        self.end_run_btn.setToolTip("Speichert ab jetzt keine Messwerte mehr in diesen Run. Kamera und Videoaufnahme laufen weiter.")
+        self.end_exp_btn.setToolTip("Beendet den laufenden Run und schließt das Experiment.")
+        end_row.addWidget(self.end_run_btn)
+        end_row.addWidget(self.end_exp_btn)
+        end_row.addStretch()
+        exp_layout.addLayout(end_row)
+        self.logging_hint = QLabel()
+        self.logging_hint.setWordWrap(True)
+        exp_layout.addWidget(self.logging_hint)
+        self.set_run_state(experiment_open=False, run_active=False)
+
         layout.addWidget(exp_group)
 
         # Readings Table (Draggable)
@@ -946,6 +961,17 @@ class ControlPanel(QWidget):
     def _on_reset_stage_clicked(self):
         self.set_stage_status(1, "Stationär", is_transition=False)
         self.stage_reset_requested.emit()
+
+    def set_run_state(self, experiment_open: bool, run_active: bool) -> None:
+        """Enables the run buttons for the current state and says whether values are saved."""
+        self.end_run_btn.setEnabled(run_active)
+        self.end_exp_btn.setEnabled(experiment_open)
+        if run_active:
+            self.logging_hint.setText("● Messwerte werden gespeichert")
+            self.logging_hint.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        else:
+            self.logging_hint.setText("Kein aktiver Run – Messwerte werden NICHT gespeichert")
+            self.logging_hint.setStyleSheet("color: #c62828; font-weight: bold;")
 
     def set_stage_status(
         self,

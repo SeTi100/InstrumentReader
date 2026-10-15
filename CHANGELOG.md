@@ -3,6 +3,23 @@
 Alle nennenswerten Änderungen an InstrumentReader. Neueste Einträge oben.
 Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
+## 2026-10-15
+
+### Runs und Experimente
+- **Knopf „Run beenden“**: beendet die Speicherung in den laufenden Run; das Experiment bleibt offen
+  für einen neuen Run. Kamera und Videoaufnahme laufen weiter. Mit Rückfrage.
+- **Knopf „Experiment beenden“**: beendet den laufenden Run und schließt das Experiment.
+- Unter den Knöpfen steht immer, ob gerade Messwerte gespeichert werden.
+- Runs haben jetzt einen Status (`running` / `completed` / `aborted`), einen Ende-Grund und die
+  Zeit des ersten und letzten Messwerts (bei Videos die Videozeit). Jeder Start, Stopp,
+  Fortsetzen und Abbruch steht in der neuen Tabelle `run_events`.
+- **Beendete Runs fortsetzen** im Runs Dashboard, mit Rückfrage; die Lücke bleibt in
+  `run_events` sichtbar. Ein geschlossenes Experiment wird dafür wieder geöffnet.
+  Der vorher laufende Run wird dabei sauber beendet (vorher blieb er offen).
+- **Nach einem Absturz** markiert die App beim Start noch laufende Runs als abgebrochen
+  (Ende = letzter Messwert) und sagt das an.
+- Behoben: Startzeiten waren UTC, Endzeiten Ortszeit (Runs wirkten 2 h falsch lang). Alle Zeiten
+  sind jetzt Ortszeit; bestehende Datenbanken werden beim Start einmalig umgestellt (nach dem Start-Backup).
 ## 2026-10-12
 
 ### Datensicherheit

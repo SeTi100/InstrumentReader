@@ -28,7 +28,9 @@ uv run --extra dev pytest
   Pro ROI lässt sich die Schriftart für die OCR wählen (siehe unten). ROI-Sätze
   lassen sich unter *File → Save/Load ROI Preset* speichern und laden.
 - **Rechenkanäle:** Formeln aus den gemessenen Kanälen bilden, z. B. Raten.
-- **Experimente und Runs:** *New Experiment* / *New Run* gliedern die Messung.
+- **Experimente und Runs:** *New Experiment* / *New Run* gliedern die Messung. *Run beenden*
+  stoppt die Speicherung (Kamera und Aufnahme laufen weiter), *Experiment beenden* schließt das
+  Experiment. Beendete oder abgebrochene Runs lassen sich im *Runs Dashboard* fortsetzen.
   Die Stufenerkennung für Waagen zeigt die aktuelle Stufe an (*Reset Stage* setzt
   sie zurück). Das *Runs Dashboard* vergleicht Runs und exportiert sie als CSV.
 - **Wiedergabe:** Bei Videos Geschwindigkeit 0,5× bis 10× oder „Max“ (so schnell
