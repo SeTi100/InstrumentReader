@@ -87,28 +87,51 @@ def rebuild_database(journal_folder: str | Path, target: str | Path) -> dict:
                     (e["id"], e.get("name"), e.get("voc_type"), e.get("description"), e.get("created_at")))
             elif ev == "run":
                 conn.execute(
-                    "INSERT OR REPLACE INTO runs (id, experiment_id, target_temperature, notes, parameters_json, started_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO runs (id, experiment_id, target_temperature, notes, parameters_json, started_at,"
+                    " status) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (e["id"], e.get("experiment_id"), e.get("target_temperature"), e.get("notes"),
-                     e.get("parameters_json", "{}"), e.get("started_at")))
+                     e.get("parameters_json", "{}"), e.get("started_at"), e.get("status")))
+                if e.get("status"):
+                    conn.execute("INSERT INTO run_events (run_id, time, event) VALUES (?, ?, 'start')",
+                                 (e["id"], e.get("started_at")))
             elif ev == "run_end":
-                conn.execute("UPDATE runs SET ended_at = ? WHERE id = ?", (e.get("ended_at"), e["id"]))
+                status = e.get("status")
+                conn.execute("UPDATE runs SET ended_at = ?, status = COALESCE(?, status), end_reason = COALESCE(?, end_reason),"
+                             " data_ended_at = COALESCE(?, data_ended_at) WHERE id = ?",
+                             (e.get("ended_at"), status, e.get("end_reason"), e.get("data_ended_at"), e["id"]))
+                if status:
+                    conn.execute("INSERT INTO run_events (run_id, time, event, reason) VALUES (?, ?, ?, ?)",
+                                 (e["id"], e.get("ended_at"), "abort" if status == "aborted" else "stop", e.get("end_reason")))
+            elif ev == "run_resume":
+                conn.execute("UPDATE runs SET status = 'running', ended_at = NULL, end_reason = NULL WHERE id = ?", (e["id"],))
+                conn.execute("INSERT INTO run_events (run_id, time, event) VALUES (?, ?, 'resume')", (e["id"], e.get("time")))
+            elif ev == "experiment_end":
+                conn.execute("UPDATE experiments SET status = 'closed', ended_at = ? WHERE id = ?", (e.get("ended_at"), e["id"]))
+            elif ev == "experiment_reopen":
+                conn.execute("UPDATE experiments SET status = 'open', ended_at = NULL WHERE id = ?", (e["id"],))
             elif ev == "readings":
+                rows = [tuple(r) for r in e.get("rows", [])]
                 conn.executemany(
                     "INSERT INTO readings (run_id, timestamp, phase_status, roi_name, raw_ocr_text, parsed_value, unit,"
                     " confidence, is_valid, validation_reason, used_fallback, is_calculated)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [tuple(r) for r in e.get("rows", [])])
+                    rows)
+                if rows:
+                    conn.execute("UPDATE runs SET data_started_at = COALESCE(data_started_at, ?), data_ended_at = ?"
+                                 " WHERE id = ?", (rows[0][1], rows[-1][1], rows[0][0]))
             elif ev == "roi_preset":
                 conn.execute("INSERT INTO roi_presets (preset_name, config_json, created_at) VALUES (?, ?, ?)",
                              (e.get("name"), e.get("config_json"), e.get("created_at")))
             elif ev == "delete_run":
                 conn.execute("DELETE FROM readings WHERE run_id = ?", (e["id"],))
+                conn.execute("DELETE FROM run_events WHERE run_id = ?", (e["id"],))
                 conn.execute("DELETE FROM runs WHERE id = ?", (e["id"],))
             elif ev == "delete_experiment":
                 conn.execute("DELETE FROM readings WHERE run_id IN (SELECT id FROM runs WHERE experiment_id = ?)", (e["id"],))
+                conn.execute("DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE experiment_id = ?)", (e["id"],))
                 conn.execute("DELETE FROM runs WHERE experiment_id = ?", (e["id"],))
                 conn.execute("DELETE FROM experiments WHERE id = ?", (e["id"],))
+        Database.upgrade_rows(conn)  # journals of older versions: UTC times, runs without status
         conn.commit()
     finally:
         conn.close()

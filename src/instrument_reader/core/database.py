@@ -96,6 +96,96 @@ class Database:
                 conn.execute("ALTER TABLE runs ADD COLUMN parameters_json TEXT DEFAULT '{}'")
             except sqlite3.OperationalError:
                 pass
+            # Run / experiment life cycle (dedicated stop, resume, crash detection)
+            for ddl in (
+                "ALTER TABLE runs ADD COLUMN status TEXT",          # running | completed | aborted
+                "ALTER TABLE runs ADD COLUMN end_reason TEXT",      # stop | new_run | switched | app_closed | experiment_end | crash
+                "ALTER TABLE runs ADD COLUMN data_started_at TIMESTAMP",  # time of the first / last reading
+                "ALTER TABLE runs ADD COLUMN data_ended_at TIMESTAMP",    # (video time for files)
+                "ALTER TABLE experiments ADD COLUMN status TEXT DEFAULT 'open'",  # open | closed
+                "ALTER TABLE experiments ADD COLUMN ended_at TIMESTAMP",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+            conn.executescript(self.RUN_EVENTS_SCHEMA)
+            self.upgrade_rows(conn)
+
+    # Start, stop, resume and abort of each run, so gaps in a resumed run stay visible.
+    RUN_EVENTS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS run_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        time TIMESTAMP NOT NULL,
+        event TEXT NOT NULL,          -- start | stop | resume | abort
+        reason TEXT,
+        FOREIGN KEY (run_id) REFERENCES runs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
+    """
+
+    @staticmethod
+    def upgrade_rows(conn) -> None:
+        """Brings rows written by older versions up to date; safe to run repeatedly.
+
+        - Timestamps from SQLite's CURRENT_TIMESTAMP are UTC ("YYYY-MM-DD HH:MM:SS"); all
+          other times in the app are local ISO ("YYYY-MM-DDTHH:MM:SS"), so they become local ISO.
+        - Runs without a status: with an end time they were completed, without one they
+          were cut off (crash), ending at their last reading.
+        """
+        legacy = "____-__-__ __:__:__"
+        for table, col in (("runs", "started_at"), ("experiments", "created_at"), ("roi_presets", "created_at")):
+            conn.execute(
+                f"UPDATE {table} SET {col} = replace(datetime({col}, 'localtime'), ' ', 'T') WHERE {col} LIKE ?",
+                (legacy,))
+        conn.execute("""
+            UPDATE runs SET
+                data_started_at = COALESCE(data_started_at, (SELECT MIN(timestamp) FROM readings WHERE run_id = runs.id)),
+                data_ended_at = COALESCE(data_ended_at, (SELECT MAX(timestamp) FROM readings WHERE run_id = runs.id))
+            WHERE status IS NULL
+        """)
+        conn.execute("UPDATE runs SET status = 'completed', end_reason = COALESCE(end_reason, 'legacy') "
+                     "WHERE status IS NULL AND ended_at IS NOT NULL")
+        conn.execute("UPDATE runs SET status = 'aborted', end_reason = COALESCE(end_reason, 'crash'), "
+                     "ended_at = COALESCE(data_ended_at, started_at) WHERE status IS NULL")
+        conn.execute("UPDATE experiments SET status = 'open' WHERE status IS NULL")
+
+    def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_experiment(self, exp_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM experiments WHERE id = ?", (exp_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_run_events(self, run_id: int) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT time, event, reason FROM run_events WHERE run_id = ? ORDER BY id", (run_id,))]
+
+    def abort_open_runs(self) -> List[int]:
+        """Marks runs still 'running' as aborted (the app ended without stopping them,
+        e.g. a crash); their end is their last reading. Call once at start-up."""
+        with sqlite3.connect(self.db_path) as conn:
+            ids = [r[0] for r in conn.execute("SELECT id FROM runs WHERE status = 'running'")]
+            for run_id in ids:
+                ended = conn.execute(
+                    "SELECT COALESCE(data_ended_at, started_at) FROM runs WHERE id = ?", (run_id,)).fetchone()[0]
+                conn.execute("UPDATE runs SET status = 'aborted', end_reason = 'crash', ended_at = ? WHERE id = ?",
+                             (ended, run_id))
+                conn.execute("INSERT INTO run_events (run_id, time, event, reason) VALUES (?, ?, 'abort', 'crash')",
+                             (run_id, ended))
+        for run_id in ids:
+            row = self.get_run(run_id)
+            self._log("run_end", id=run_id, ended_at=row["ended_at"], status="aborted", end_reason="crash",
+                      data_ended_at=row["data_ended_at"])
+        return ids
 
     def get_run_channels(self, run_id: int):
         """Returns list of (roi_name, is_calculated) for the given run_id."""
@@ -123,8 +213,8 @@ class Database:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT id, name, voc_type, description, created_at 
-                FROM experiments 
+                SELECT id, name, voc_type, description, created_at, status, ended_at
+                FROM experiments
                 ORDER BY id DESC
             """)
             experiments = [dict(row) for row in cursor.fetchall()]
@@ -133,7 +223,7 @@ class Database:
                 cursor.execute("""
                     SELECT r.id, r.experiment_id, r.target_temperature, r.notes, 
                            r.parameters_json,
-                           r.started_at, r.ended_at,
+                           r.started_at, r.ended_at, r.status, r.end_reason,
                            COUNT(rd.id) AS reading_count,
                            MIN(rd.timestamp) AS first_reading,
                            MAX(rd.timestamp) AS last_reading
@@ -166,6 +256,7 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM readings WHERE run_id = ?", (run_id,))
+            cursor.execute("DELETE FROM run_events WHERE run_id = ?", (run_id,))
             cursor.execute("DELETE FROM runs WHERE id = ?", (run_id,))
             conn.commit()
         self._log("delete_run", id=run_id)
@@ -179,6 +270,8 @@ class Database:
                     SELECT id FROM runs WHERE experiment_id = ?
                 )
             """, (experiment_id,))
+            cursor.execute(
+                "DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE experiment_id = ?)", (experiment_id,))
             cursor.execute("DELETE FROM runs WHERE experiment_id = ?", (experiment_id,))
             cursor.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
             conn.commit()

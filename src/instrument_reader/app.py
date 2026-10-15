@@ -45,7 +45,17 @@ def prepare_data(parent=None) -> bool:
         elif clicked is not go_on:
             return False
 
-    data_safety.backup_database(db, "start")
+    data_safety.backup_database(db, "start")  # before any schema upgrade below
+
+    from .core.database import Database
+
+    aborted = Database(str(db)).abort_open_runs()
+    if aborted:
+        QMessageBox.information(
+            parent, "Runs nicht beendet",
+            "Beim letzten Mal wurde die App nicht normal beendet (z. B. Absturz). "
+            f"Diese Runs sind jetzt als abgebrochen markiert, Ende = letzter Messwert: "
+            f"{', '.join(map(str, aborted))}.\n\nIm Runs Dashboard kannst du sie fortsetzen.")
     data_safety.save_state(db)
     return True
 

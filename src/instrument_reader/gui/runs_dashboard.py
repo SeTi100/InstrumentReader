@@ -337,7 +337,7 @@ class RunsDashboardDialog(QDialog):
         for exp in experiments:
             exp_item = QTreeWidgetItem(self.tree)
             exp_item.setText(0, f"Exp {exp['id']}")
-            exp_item.setText(1, exp.get("name") or "")
+            exp_item.setText(1, (exp.get("name") or "") + (" (geschlossen)" if exp.get("status") == "closed" else ""))
             exp_item.setText(2, exp.get("voc_type") or "")
             exp_item.setText(4, exp.get("created_at") or "")
 
@@ -357,7 +357,8 @@ class RunsDashboardDialog(QDialog):
                 run_item = QTreeWidgetItem(exp_item)
                 run_id = run["id"]
                 is_active = (run_id == self.current_run_id)
-                prefix = f"Run {run_id} [ACTIVE]" if is_active else f"Run {run_id}"
+                status_tag = {"aborted": " [ABGEBROCHEN]", "completed": ""}.get(run.get("status"), "")
+                prefix = f"Run {run_id} [ACTIVE]" if is_active else f"Run {run_id}{status_tag}"
 
                 run_item.setText(0, prefix)
                 run_item.setText(1, run.get("notes") or "")
@@ -554,6 +555,10 @@ class RunsDashboardDialog(QDialog):
 
         return sorted(list(selected))
 
+    def _experiment_closed(self, exp_id: int) -> bool:
+        exp = self.db.get_experiment(exp_id)
+        return bool(exp and exp.get("status") == "closed")
+
     def set_as_active(self):
         curr = self.tree.currentItem()
         if not curr:
@@ -568,6 +573,18 @@ class RunsDashboardDialog(QDialog):
         run_id = data["id"]
         exp_id = data["exp_id"]
         exp_name = data["exp_name"]
+        run = data.get("data") or {}
+        if run_id != self.current_run_id and run.get("status") in ("completed", "aborted"):
+            how = "abgebrochen" if run.get("status") == "aborted" else "beendet"
+            if QMessageBox.question(
+                self, "Run fortsetzen",
+                f"Run {run_id} wurde {how} ({run.get('ended_at') or '?'}).\n\n"
+                "Fortsetzen? Neue Messwerte kommen in diesen Run, die Lücke bis jetzt wird festgehalten. "
+                "Ein gerade laufender Run wird vorher beendet."
+                + ("\n\nDas Experiment ist geschlossen und wird dafür wieder geöffnet."
+                   if self._experiment_closed(exp_id) else ""),
+            ) != QMessageBox.Yes:
+                return
         self.current_run_id = run_id
         self.active_run_changed.emit(run_id, exp_id, exp_name)
         self.refresh_tree()
