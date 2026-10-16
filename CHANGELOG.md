@@ -3,6 +3,19 @@
 Alle nennenswerten Änderungen an InstrumentReader. Neueste Einträge oben.
 Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
+## 2026-10-17
+
+### Ablesung → Excel
+- **Knopf „Ablesung“ (auch Taste F9)**: speichert den aktuellen Wert des gewählten Waagen-ROIs mit
+  der Uhrzeit des Klicks. Klicks wechseln zwischen Start (Masse_0/Zeit_0) und Ende (Masse_1/Zeit_1),
+  ein Messschritt ergibt eine Zeile `Masse_0 | Masse_1 | Zeit_0 | Zeit_1` wie Spalten D:G im Labjournal.
+  „Neue Zeile“ beginnt die nächste Zeile, auch wenn Masse_1 fehlt.
+- Pro Tag `ablesungen/Ablesungen_JJJJ-MM-TT.csv` (nur anhängend, Grundlage nach Neustart) und
+  `Ablesungen_JJJJ-MM-TT.xlsx` (Blätter „Ablesungen“ und „Protokoll“). Ist die xlsx in Excel geöffnet,
+  bleibt der Klick in der CSV und die xlsx wird beim nächsten Klick nachgetragen.
+- Kein gültiger Waagenwert: die Zeit wird trotzdem gespeichert, der Wert rot markiert.
+- Neue Abhängigkeit `openpyxl`.
+
 ## 2026-10-15
 
 ### Runs und Experimente

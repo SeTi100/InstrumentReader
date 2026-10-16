@@ -37,6 +37,11 @@ uv run --extra dev pytest
   wie möglich, ohne Messintervalle zu überspringen). Zurückspulen muss erst
   freigeschaltet werden.
 
+- **Ablesung → Excel:** Waagen-ROI wählen, dann bei jedem Blick auf die Waage *Ablesung* klicken
+  oder F9 drücken. Gespeichert werden Wert und Uhrzeit, abwechselnd als Masse_0/Zeit_0 und
+  Masse_1/Zeit_1, in `ablesungen/Ablesungen_<Datum>.xlsx` (Spalten wie D:G im Labjournal, zum
+  Hineinkopieren) und `.csv` (Sicherung). *Excel öffnen* öffnet die Datei des Tages.
+
 Alle Daten liegen im Datenordner, siehe [Datensicherheit](#datensicherheit).
 
 ## Datensicherheit
@@ -52,6 +57,7 @@ Datenordner selbst in einem Git-Ordner, startet die App nicht.
 | `journal/JJJJ-MM-TT.jsonl` | **Nur anhängbares Journal** aller Schreibvorgänge; vergangene Tage schreibgeschützt |
 | `backups/` | Automatische Backups: beim Start, nach jedem Run, alle 30 min und beim Schließen |
 | `recordings/` | Videoaufnahmen mit Zeitstempel-Dateien |
+| `ablesungen/` | Ablesungen per Knopf/F9, pro Tag als `.csv` und `.xlsx` |
 | `state.json` | Wie viele Daten beim letzten Mal da waren |
 | `settings.json` | Optional, z. B. `{"backup_mirror": "D:\\Backups"}` |
 

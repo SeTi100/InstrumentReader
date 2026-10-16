@@ -2,12 +2,15 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from instrument_reader.core import data_safety
+from instrument_reader.core.ablesung import AblesungLog
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -173,6 +176,17 @@ class MainWindow(QMainWindow):
         self.control_panel.roi_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.control_panel.roi_list.customContextMenuRequested.connect(self.on_roi_context_menu)
         self.control_panel.stage_reset_requested.connect(self.on_reset_stage)
+
+        # Manual readings (Ablesung): button or F9 anywhere in the window
+        self.ablesung_log = AblesungLog(data_safety.data_dir() / "ablesungen")
+        self.control_panel.ablesung_btn.clicked.connect(self.take_ablesung)
+        self.control_panel.ablesung_new_row_btn.clicked.connect(self.ablesung_new_row)
+        self.control_panel.ablesung_open_btn.clicked.connect(self.open_ablesung_xlsx)
+        self._ablesung_shortcut = QShortcut(QKeySequence(Qt.Key_F9), self)
+        self._ablesung_shortcut.setContext(Qt.ApplicationShortcut)
+        self._ablesung_shortcut.activated.connect(self.take_ablesung)
+        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
+        self.control_panel.set_ablesung_status(f"Datei: {self.ablesung_log.xlsx_path}")
 
     def on_reset_stage(self):
         self.calc_engine.reset_scale_detector(hard=False)
@@ -606,8 +620,55 @@ class MainWindow(QMainWindow):
         self.db_writer.end_experiment(exp_id)
         self.clear_active_run()
             
+    def take_ablesung(self):
+        """Stores the scale value shown right now with the current time (Masse_0/Zeit_0,
+        next press Masse_1/Zeit_1) into the day's Ablesungen file."""
+        if not self.control_panel.scale_roi_combo.count():
+            self.control_panel.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
+        roi = self.control_panel.scale_roi_combo.currentText()
+        r = next((x for x in self.video_widget.latest_readings if x.get("roi_name") == roi), None)
+        value = r.get("parsed_value") if r else None
+        valid = bool(r and value is not None and r.get("is_valid", True))
+        ts = r.get("timestamp") if r else None
+        try:
+            entry = self.ablesung_log.record(
+                value=value,
+                valid=valid,
+                raw_text=str(r.get("raw_text", "")) if r else "",
+                roi=roi,
+                run_id=self.db_writer.current_run_id,
+                reading_time=datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else None,
+            )
+        except OSError as e:
+            QMessageBox.critical(self, "Ablesung nicht gespeichert",
+                                 f"Die Ablesung konnte nicht gespeichert werden:\n{e}\n\nBitte von Hand notieren.")
+            return
+        xlsx_ok = self.ablesung_log.write_xlsx()
+        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
+
+        shown = "kein Wert" if value is None else f"{value:g}"
+        msg = f"{entry.slot} = {shown}  um {entry.when:%H:%M:%S}"
+        if not valid:
+            msg += f"  – ACHTUNG: kein gültiger Waagenwert ({roi or 'kein ROI'}), Zeit ist gespeichert"
+        if not xlsx_ok:
+            msg += "  – Excel-Datei ist geöffnet, wird beim nächsten Klick nachgetragen (CSV ist gespeichert)"
+        self.control_panel.set_ablesung_status(msg, ok=valid and xlsx_ok)
+        self.statusBar().showMessage(msg, 10000)
+
+    def ablesung_new_row(self):
+        self.ablesung_log.start_new_row()
+        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
+
+    def open_ablesung_xlsx(self):
+        path = self.ablesung_log.xlsx_path
+        if not path.exists():
+            self.ablesung_log.write_xlsx()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def on_readings_ready(self, readings, timestamp=None):
         self.control_panel.update_readings(readings)
+        self.control_panel.set_scale_roi_names(
+            list(dict.fromkeys(r["roi_name"] for r in readings if r.get("roi_name"))))
         self.video_widget.update_readings(readings)
 
         # Check if readings have timestamp or use parameter
