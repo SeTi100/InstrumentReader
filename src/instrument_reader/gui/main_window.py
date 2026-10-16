@@ -24,6 +24,7 @@ from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
 from instrument_reader.gui.camera_thread import CameraThread
 from instrument_reader.core.camera_devices import label_name, parse_source
+from instrument_reader.gui.live_plot import LivePlotWidget
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -73,8 +74,11 @@ class MainWindow(QMainWindow):
         top_splitter.addWidget(self.video_widget)
         top_splitter.addWidget(self.control_panel)
         top_splitter.setSizes([800, 400])
-        
-        main_layout.addWidget(top_splitter)
+
+        self.live_plot = LivePlotWidget()
+
+        main_layout.addWidget(top_splitter, 1)
+        main_layout.addWidget(self.live_plot)
         self.setCentralWidget(central)
         
     def setup_connections(self):
@@ -87,6 +91,7 @@ class MainWindow(QMainWindow):
                         if getattr(self.camera, "is_eof", lambda: False)():
                             self.calc_engine.history.clear()
                             self.calc_engine.reset_scale_detector(hard=False)
+                            self.live_plot.clear()
                             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
                             self.db_writer.set_phase("STAGE_1")
                             self.camera_thread.seek_to_frame(0)
@@ -187,6 +192,7 @@ class MainWindow(QMainWindow):
         # Clear calculation engine history buffer and reset scale step detector
         self.calc_engine.history.clear()
         self.calc_engine.reset_scale_detector(hard=False)
+        self.live_plot.clear()
         self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
         self.db_writer.set_phase("STAGE_1")
 
@@ -258,6 +264,12 @@ class MainWindow(QMainWindow):
         db_menu = menu.addMenu("Database")
         dashboard_act = db_menu.addAction("Runs Dashboard...")
         dashboard_act.triggered.connect(self.open_runs_dashboard)
+
+        view_menu = menu.addMenu("View")
+        self.live_plot_act = view_menu.addAction("Live-Diagramm")
+        self.live_plot_act.setCheckable(True)
+        self.live_plot_act.setChecked(True)
+        self.live_plot_act.toggled.connect(self.live_plot.setVisible)
         
     def set_draw_mode(self, mode):
         self.control_panel.rect_btn.setChecked(mode == ROIShape.RECTANGLE)
@@ -479,6 +491,7 @@ class MainWindow(QMainWindow):
             self.control_panel.exp_label.setText(f"Experiment: {data['exp_name']} (ID: {exp_id}) | Run: {run_id}")
             self._update_run_ui()
             self.calc_engine.reset_scale_detector(hard=True)
+            self.live_plot.clear()
             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
             self.db_writer.set_phase("STAGE_1")
 
@@ -517,6 +530,7 @@ class MainWindow(QMainWindow):
             )
             self._update_run_ui()
             self.calc_engine.reset_scale_detector(hard=True)
+            self.live_plot.clear()
             self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
             self.db_writer.set_phase("STAGE_1")
 
@@ -552,6 +566,7 @@ class MainWindow(QMainWindow):
         self.control_panel.exp_label.setText(f"Experiment: {exp_name} (ID: {exp_id}) | Run: {run_id}")
         self._update_run_ui()
         self.calc_engine.reset_scale_detector(hard=True)
+        self.live_plot.clear()
         self.control_panel.set_stage_status(1, "Stationär", is_transition=False)
         self.db_writer.set_phase("STAGE_1")
 
@@ -647,6 +662,15 @@ class MainWindow(QMainWindow):
                     is_transition=False,
                 )
             self.db_writer.set_phase(phase)
+
+        scale_name = self.calc_engine.scale_roi_name
+        self.live_plot.update_data(
+            ts,
+            scale_name,
+            current_vals.get(scale_name) if scale_name else None,
+            detector.corrected_mass if detector.has_readings else None,
+            calc_results,
+        )
 
         # Prepare combined readings for database logging
         all_readings = list(readings)
