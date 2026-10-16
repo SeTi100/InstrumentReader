@@ -854,6 +854,40 @@ class ControlPanel(QWidget):
 
         layout.addWidget(exp_group)
 
+        # Manual readings: one press stores scale value + time into the day's Excel file
+        abl_group = QGroupBox("Ablesung → Excel")
+        abl_layout = QVBoxLayout(abl_group)
+        roi_row = QHBoxLayout()
+        roi_row.addWidget(QLabel("Waage-ROI:"))
+        self.scale_roi_combo = QComboBox()
+        roi_row.addWidget(self.scale_roi_combo, 1)
+        abl_layout.addLayout(roi_row)
+
+        self.ablesung_btn = QPushButton()
+        self.ablesung_btn.setMinimumHeight(44)
+        self.ablesung_btn.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.ablesung_btn.setToolTip("Speichert den aktuellen Waagenwert mit der Uhrzeit (auch mit F9, egal welches Fenster-Element aktiv ist).")
+        abl_layout.addWidget(self.ablesung_btn)
+
+        abl_btn_row = QHBoxLayout()
+        self.ablesung_new_row_btn = QPushButton("Neue Zeile")
+        self.ablesung_new_row_btn.setToolTip("Nächster Klick beginnt eine neue Zeile mit Masse_0, auch wenn Masse_1 noch fehlt.")
+        self.ablesung_open_btn = QPushButton("Excel öffnen")
+        abl_btn_row.addWidget(self.ablesung_new_row_btn)
+        abl_btn_row.addWidget(self.ablesung_open_btn)
+        abl_layout.addLayout(abl_btn_row)
+
+        self.ablesung_table = QTableWidget(0, 4)
+        self.ablesung_table.setHorizontalHeaderLabels(["Masse_0", "Masse_1", "Zeit_0", "Zeit_1"])
+        self.ablesung_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ablesung_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ablesung_table.setMinimumHeight(130)
+        abl_layout.addWidget(self.ablesung_table)
+        self.ablesung_status = QLabel()
+        self.ablesung_status.setWordWrap(True)
+        abl_layout.addWidget(self.ablesung_status)
+        layout.addWidget(abl_group)
+
         # Readings Table (Draggable)
         layout.addWidget(QLabel("<b>Live Readings (Drag ROIs to calculations):</b>"))
         self.readings_table = DraggableTableWidget(0, 5)
@@ -957,6 +991,45 @@ class ControlPanel(QWidget):
             item = self.readings_table.item(row, 0)
             if item and item.text() == old_name:
                 item.setText(new_name)
+
+    def set_scale_roi_names(self, names: List[str]) -> None:
+        """Offers the ROIs for the manual reading; keeps the choice, else prefers a 'Waage'."""
+        current = [self.scale_roi_combo.itemText(i) for i in range(self.scale_roi_combo.count())]
+        if names == current:
+            return
+        selected = self.scale_roi_combo.currentText()
+        self.scale_roi_combo.blockSignals(True)
+        self.scale_roi_combo.clear()
+        self.scale_roi_combo.addItems(names)
+        if selected not in names:
+            selected = next((n for n in names if "waage" in n.lower()), names[0] if names else "")
+        self.scale_roi_combo.setCurrentText(selected)
+        self.scale_roi_combo.blockSignals(False)
+
+    def show_ablesungen(self, steps, next_slot: str) -> None:
+        """Shows the day's rows (Masse_0 | Masse_1 | Zeit_0 | Zeit_1) and what the next press stores."""
+        self.ablesung_table.setRowCount(len(steps))
+        for i, step in enumerate(steps):
+            for col, (entry, kind) in enumerate(
+                ((step.start, "v"), (step.end, "v"), (step.start, "t"), (step.end, "t"))
+            ):
+                if entry is None:
+                    text = ""
+                elif kind == "t":
+                    text = entry.when.strftime("%H:%M:%S")
+                else:
+                    text = "–" if entry.value is None else f"{entry.value:g}"
+                item = QTableWidgetItem(text)
+                if entry is not None and not entry.valid:
+                    item.setBackground(QColor("#ffc7ce"))
+                self.ablesung_table.setItem(i, col, item)
+        self.ablesung_table.scrollToBottom()
+        label = "Start: Masse_0 + Zeit_0" if next_slot == "Masse_0" else "Ende: Masse_1 + Zeit_1"
+        self.ablesung_btn.setText(f"⏱ Ablesung – {label}   [F9]")
+
+    def set_ablesung_status(self, text: str, ok: bool = True) -> None:
+        self.ablesung_status.setText(text)
+        self.ablesung_status.setStyleSheet("" if ok else "color: #c62828; font-weight: bold;")
 
     def _on_reset_stage_clicked(self):
         self.set_stage_status(1, "Stationär", is_transition=False)
