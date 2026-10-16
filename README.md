@@ -37,10 +37,12 @@ uv run --extra dev pytest
   wie möglich, ohne Messintervalle zu überspringen). Zurückspulen muss erst
   freigeschaltet werden.
 
-- **Ablesung → Excel:** Waagen-ROI wählen, dann bei jedem Blick auf die Waage *Ablesung* klicken
-  oder F9 drücken. Gespeichert werden Wert und Uhrzeit, abwechselnd als Masse_0/Zeit_0 und
-  Masse_1/Zeit_1, in `ablesungen/Ablesungen_<Datum>.xlsx` (Spalten wie D:G im Labjournal, zum
-  Hineinkopieren) und `.csv` (Sicherung). *Excel öffnen* öffnet die Datei des Tages.
+- **Ablesung → Labjournal:** Labjournal in Excel öffnen, Cursor in die Zeile des Messschritts
+  setzen, Waagen-ROI wählen. **F9 (T0)** schreibt Waagenwert und Uhrzeit in Masse_0/Zeit_0,
+  **F10 (T1)** in Masse_1/Zeit_1 dieser Zeile. Die Tasten gehen auch, wenn Excel vorne ist.
+  Belegte Zellen werden nie überschrieben; das Panel zeigt vorher, wohin geschrieben wird.
+  Jeder Tastendruck steht zusätzlich in `ablesungen/Ablesungen_<Datum>.csv`.
+  `INSTRUMENT_READER_EXCEL=0` schaltet die Excel-Anbindung und die Tasten ab.
 
 Alle Daten liegen im Datenordner, siehe [Datensicherheit](#datensicherheit).
 
@@ -57,7 +59,7 @@ Datenordner selbst in einem Git-Ordner, startet die App nicht.
 | `journal/JJJJ-MM-TT.jsonl` | **Nur anhängbares Journal** aller Schreibvorgänge; vergangene Tage schreibgeschützt |
 | `backups/` | Automatische Backups: beim Start, nach jedem Run, alle 30 min und beim Schließen |
 | `recordings/` | Videoaufnahmen mit Zeitstempel-Dateien |
-| `ablesungen/` | Ablesungen per Knopf/F9, pro Tag als `.csv` und `.xlsx` |
+| `ablesungen/` | Protokoll jedes T0/T1-Tastendrucks, pro Tag eine `.csv` |
 | `state.json` | Wie viele Daten beim letzten Mal da waren |
 | `settings.json` | Optional, z. B. `{"backup_mirror": "D:\\Backups"}` |
 
@@ -149,5 +151,6 @@ Zeitmessung: `python scripts/benchmark_ocr.py`
 | `INSTRUMENT_READER_CAMERA_HELPER` | `0`: Kamera ohne Hilfsprozess lesen |
 | `INSTRUMENT_READER_DATA_DIR` | Datenordner (Standard `%USERPROFILE%\InstrumentReader-Daten`) |
 | `INSTRUMENT_READER_BACKUP_MIRROR` | Zweiter Ordner für jede Datenbank-Sicherung |
+| `INSTRUMENT_READER_EXCEL` | `0`: keine Excel-Anbindung, F9/F10 nicht systemweit |
 
 Änderungen stehen in [CHANGELOG.md](CHANGELOG.md).
