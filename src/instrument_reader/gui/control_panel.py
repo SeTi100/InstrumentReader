@@ -1,3 +1,4 @@
+import html
 import uuid
 from typing import Dict, List, Optional, Any
 
@@ -854,38 +855,42 @@ class ControlPanel(QWidget):
 
         layout.addWidget(exp_group)
 
-        # Manual readings: one press stores scale value + time into the day's Excel file
-        abl_group = QGroupBox("Ablesung → Excel")
+        # Manual readings: T0/T1 write scale value + time into the row selected in Excel
+        abl_group = QGroupBox("Ablesung → Labjournal (Excel)")
         abl_layout = QVBoxLayout(abl_group)
         roi_row = QHBoxLayout()
         roi_row.addWidget(QLabel("Waage-ROI:"))
         self.scale_roi_combo = QComboBox()
         roi_row.addWidget(self.scale_roi_combo, 1)
+        self.scale_value_label = QLabel("Waage: –")
+        self.scale_value_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        roi_row.addWidget(self.scale_value_label)
         abl_layout.addLayout(roi_row)
 
-        self.ablesung_btn = QPushButton()
-        self.ablesung_btn.setMinimumHeight(44)
-        self.ablesung_btn.setStyleSheet("font-size: 14px; font-weight: bold;")
-        self.ablesung_btn.setToolTip("Speichert den aktuellen Waagenwert mit der Uhrzeit (auch mit F9, egal welches Fenster-Element aktiv ist).")
-        abl_layout.addWidget(self.ablesung_btn)
+        self.excel_target_label = QLabel()
+        self.excel_target_label.setWordWrap(True)
+        self.excel_target_label.setTextFormat(Qt.RichText)
+        self.excel_target_label.setMinimumHeight(54)
+        self.excel_target_label.setStyleSheet("padding: 4px; border: 1px solid #999; border-radius: 3px;")
+        abl_layout.addWidget(self.excel_target_label)
 
-        abl_btn_row = QHBoxLayout()
-        self.ablesung_new_row_btn = QPushButton("Neue Zeile")
-        self.ablesung_new_row_btn.setToolTip("Nächster Klick beginnt eine neue Zeile mit Masse_0, auch wenn Masse_1 noch fehlt.")
-        self.ablesung_open_btn = QPushButton("Excel öffnen")
-        abl_btn_row.addWidget(self.ablesung_new_row_btn)
-        abl_btn_row.addWidget(self.ablesung_open_btn)
-        abl_layout.addLayout(abl_btn_row)
+        t_row = QHBoxLayout()
+        self.t0_btn = QPushButton("T0 → Masse_0 + Zeit_0   [F9]")
+        self.t1_btn = QPushButton("T1 → Masse_1 + Zeit_1   [F10]")
+        for b in (self.t0_btn, self.t1_btn):
+            b.setMinimumHeight(40)
+            b.setStyleSheet("font-weight: bold;")
+            b.setToolTip("Schreibt Waagenwert und Uhrzeit in die Zeile, in der in Excel der Cursor steht. "
+                         "Belegte Zellen werden nie überschrieben.")
+            t_row.addWidget(b)
+        abl_layout.addLayout(t_row)
 
-        self.ablesung_table = QTableWidget(0, 4)
-        self.ablesung_table.setHorizontalHeaderLabels(["Masse_0", "Masse_1", "Zeit_0", "Zeit_1"])
-        self.ablesung_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.ablesung_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.ablesung_table.setMinimumHeight(130)
-        abl_layout.addWidget(self.ablesung_table)
         self.ablesung_status = QLabel()
         self.ablesung_status.setWordWrap(True)
         abl_layout.addWidget(self.ablesung_status)
+        self.ablesung_history = QListWidget()
+        self.ablesung_history.setMaximumHeight(90)
+        abl_layout.addWidget(self.ablesung_history)
         layout.addWidget(abl_group)
 
         # Readings Table (Draggable)
@@ -1006,26 +1011,36 @@ class ControlPanel(QWidget):
         self.scale_roi_combo.setCurrentText(selected)
         self.scale_roi_combo.blockSignals(False)
 
-    def show_ablesungen(self, steps, next_slot: str) -> None:
-        """Shows the day's rows (Masse_0 | Masse_1 | Zeit_0 | Zeit_1) and what the next press stores."""
-        self.ablesung_table.setRowCount(len(steps))
-        for i, step in enumerate(steps):
-            for col, (entry, kind) in enumerate(
-                ((step.start, "v"), (step.end, "v"), (step.start, "t"), (step.end, "t"))
-            ):
-                if entry is None:
-                    text = ""
-                elif kind == "t":
-                    text = entry.when.strftime("%H:%M:%S")
-                else:
-                    text = "–" if entry.value is None else f"{entry.value:g}"
-                item = QTableWidgetItem(text)
-                if entry is not None and not entry.valid:
-                    item.setBackground(QColor("#ffc7ce"))
-                self.ablesung_table.setItem(i, col, item)
-        self.ablesung_table.scrollToBottom()
-        label = "Start: Masse_0 + Zeit_0" if next_slot == "Masse_0" else "Ende: Masse_1 + Zeit_1"
-        self.ablesung_btn.setText(f"⏱ Ablesung – {label}   [F9]")
+    def show_excel_target(self, target, error: str = "") -> None:
+        """Shows where T0/T1 would write right now (or why they can't)."""
+        if error:
+            self.excel_target_label.setText(f"<b>Ziel:</b> <span style='color:#c62828'>{html.escape(error)}</span>")
+            return
+
+        def cell(name):
+            v = target.values.get(name)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                return "<span style='color:#2e7d32'>leer</span>"
+            if name.startswith("Zeit") and isinstance(v, float) and 0 <= v < 1:
+                s = round(v * 86400)
+                v = f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+            elif isinstance(v, float):
+                v = f"{v:g}"
+            return f"<b>{html.escape(str(v))}</b>"
+
+        ctx = f" ({html.escape(target.context)})" if target.context else ""
+        self.excel_target_label.setText(
+            f"<b>Ziel:</b> {html.escape(target.workbook)} › {html.escape(target.sheet)} › <b>Zeile {target.row}</b>{ctx}<br>"
+            f"T0: Masse_0 {cell('Masse_0')}, Zeit_0 {cell('Zeit_0')} &nbsp;|&nbsp; "
+            f"T1: Masse_1 {cell('Masse_1')}, Zeit_1 {cell('Zeit_1')}")
+
+    def show_scale_value(self, text: str, ok: bool) -> None:
+        self.scale_value_label.setText(f"Waage: {text}")
+        self.scale_value_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold;" + ("" if ok else " color: #c62828;"))
+
+    def add_ablesung_history(self, text: str) -> None:
+        self.ablesung_history.insertItem(0, text)
 
     def set_ablesung_status(self, text: str, ok: bool = True) -> None:
         self.ablesung_status.setText(text)

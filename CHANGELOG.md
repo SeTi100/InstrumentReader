@@ -5,16 +5,19 @@ Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
 ## 2026-10-17
 
-### Ablesung → Excel
-- **Knopf „Ablesung“ (auch Taste F9)**: speichert den aktuellen Wert des gewählten Waagen-ROIs mit
-  der Uhrzeit des Klicks. Klicks wechseln zwischen Start (Masse_0/Zeit_0) und Ende (Masse_1/Zeit_1),
-  ein Messschritt ergibt eine Zeile `Masse_0 | Masse_1 | Zeit_0 | Zeit_1` wie Spalten D:G im Labjournal.
-  „Neue Zeile“ beginnt die nächste Zeile, auch wenn Masse_1 fehlt.
-- Pro Tag `ablesungen/Ablesungen_JJJJ-MM-TT.csv` (nur anhängend, Grundlage nach Neustart) und
-  `Ablesungen_JJJJ-MM-TT.xlsx` (Blätter „Ablesungen“ und „Protokoll“). Ist die xlsx in Excel geöffnet,
-  bleibt der Klick in der CSV und die xlsx wird beim nächsten Klick nachgetragen.
-- Kein gültiger Waagenwert: die Zeit wird trotzdem gespeichert, der Wert rot markiert.
-- Neue Abhängigkeit `openpyxl`.
+### Ablesung → Labjournal (Excel)
+- **T0 (F9) und T1 (F10)** schreiben den aktuellen Wert des gewählten Waagen-ROIs und die Uhrzeit
+  des Tastendrucks direkt in das in Excel offene Labjournal: in die Zeile, in der der Cursor steht,
+  in die Spalten Masse_0/Zeit_0 bzw. Masse_1/Zeit_1 (gefunden über die Kopfzeile der Tabelle).
+  Die Tasten wirken systemweit, also auch wenn Excel vorne ist.
+- **Nie überschreiben:** Ist eine der beiden Zielzellen belegt, wird nichts geschrieben (Warnton,
+  rote Meldung). Ein doppelter Tastendruck ändert also nichts. Korrigiert wird direkt in Excel.
+- Ohne gültigen Waagenwert wird nichts geschrieben; die Meldung nennt die Uhrzeit des Drucks.
+- Das Panel zeigt laufend das Ziel (Mappe, Blatt, Zeile, Temperatur/V_MFC) und ob die Zellen leer
+  sind, dazu den Waagenwert. Geschriebene Zellen leuchten in Excel kurz grün.
+- Jeder Tastendruck steht zusätzlich in `ablesungen/Ablesungen_JJJJ-MM-TT.csv` (Wert, OCR-Rohtext,
+  Ergebnis), auch wenn nichts geschrieben wurde.
+- Neue Abhängigkeit `pywin32` (nur Windows).
 
 ## 2026-10-15
 

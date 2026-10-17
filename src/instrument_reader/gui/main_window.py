@@ -7,10 +7,12 @@ from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from instrument_reader.core import data_safety
 from instrument_reader.core.ablesung import AblesungLog
+from instrument_reader.core.excel_link import ExcelError, ExcelLink
+from instrument_reader.gui import global_hotkeys
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -27,6 +29,9 @@ from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
 from instrument_reader.gui.camera_thread import CameraThread
 from instrument_reader.core.camera_devices import label_name, parse_source
+
+EXCEL_POLL_MS = 700
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -177,16 +182,21 @@ class MainWindow(QMainWindow):
         self.control_panel.roi_list.customContextMenuRequested.connect(self.on_roi_context_menu)
         self.control_panel.stage_reset_requested.connect(self.on_reset_stage)
 
-        # Manual readings (Ablesung): button or F9 anywhere in the window
+        # Manual readings (Ablesung): T0/T1 write into the row selected in the open Excel journal
         self.ablesung_log = AblesungLog(data_safety.data_dir() / "ablesungen")
-        self.control_panel.ablesung_btn.clicked.connect(self.take_ablesung)
-        self.control_panel.ablesung_new_row_btn.clicked.connect(self.ablesung_new_row)
-        self.control_panel.ablesung_open_btn.clicked.connect(self.open_ablesung_xlsx)
-        self._ablesung_shortcut = QShortcut(QKeySequence(Qt.Key_F9), self)
-        self._ablesung_shortcut.setContext(Qt.ApplicationShortcut)
-        self._ablesung_shortcut.activated.connect(self.take_ablesung)
-        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
-        self.control_panel.set_ablesung_status(f"Datei: {self.ablesung_log.xlsx_path}")
+        self.excel_link = ExcelLink()
+        self.control_panel.t0_btn.clicked.connect(lambda: self.take_ablesung("T0"))
+        self.control_panel.t1_btn.clicked.connect(lambda: self.take_ablesung("T1"))
+        self._flashed = []
+        self._unflash_timer = QTimer(self)
+        self._unflash_timer.setInterval(1500)
+        self._unflash_timer.timeout.connect(self._unflash)
+        self._excel_poll = QTimer(self)
+        self._excel_poll.setInterval(EXCEL_POLL_MS)
+        self._excel_poll.timeout.connect(self.refresh_excel_target)
+        if os.environ.get("INSTRUMENT_READER_EXCEL", "1") != "0":
+            self._excel_poll.start()
+        self._setup_ablesung_hotkeys()
 
     def on_reset_stage(self):
         self.calc_engine.reset_scale_detector(hard=False)
@@ -620,55 +630,116 @@ class MainWindow(QMainWindow):
         self.db_writer.end_experiment(exp_id)
         self.clear_active_run()
             
-    def take_ablesung(self):
-        """Stores the scale value shown right now with the current time (Masse_0/Zeit_0,
-        next press Masse_1/Zeit_1) into the day's Ablesungen file."""
-        if not self.control_panel.scale_roi_combo.count():
-            self.control_panel.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
+    def _setup_ablesung_hotkeys(self):
+        """F9 = T0, F10 = T1, system-wide so they work while Excel has the focus. If Windows
+        refuses (key taken by another program), they work only inside this window."""
+        self._hotkey_slots = {}
+        failed = []
+        if QGuiApplication.platformName() == "windows" and os.environ.get("INSTRUMENT_READER_EXCEL", "1") != "0":
+            hwnd = int(self.winId())
+            for hk_id, (vk, slot) in enumerate(((global_hotkeys.VK_F9, "T0"), (global_hotkeys.VK_F10, "T1")), start=1):
+                if global_hotkeys.register(hwnd, hk_id, vk):
+                    self._hotkey_slots[hk_id] = slot
+                else:
+                    failed.append(slot)
+            if failed:
+                self.control_panel.set_ablesung_status(
+                    "F9/F10 sind von einem anderen Programm belegt – sie wirken nur in diesem Fenster. "
+                    "Die Knöpfe T0/T1 gehen immer.", ok=False)
+        else:
+            failed = ["T0", "T1"]
+        for key, slot in ((Qt.Key_F9, "T0"), (Qt.Key_F10, "T1")):
+            if slot in failed:
+                sc = QShortcut(QKeySequence(key), self)
+                sc.setContext(Qt.ApplicationShortcut)
+                sc.activated.connect(lambda s=slot: self.take_ablesung(s))
+
+    def nativeEvent(self, event_type, message):
+        hk = global_hotkeys.hotkey_id(event_type, message)
+        if hk in getattr(self, "_hotkey_slots", {}):
+            # Leave the native handler first; the write talks to Excel.
+            slot = self._hotkey_slots[hk]
+            QTimer.singleShot(0, lambda: self.take_ablesung(slot))
+            return True, 0
+        return super().nativeEvent(event_type, message)
+
+    def _current_scale_reading(self):
         roi = self.control_panel.scale_roi_combo.currentText()
         r = next((x for x in self.video_widget.latest_readings if x.get("roi_name") == roi), None)
         value = r.get("parsed_value") if r else None
         valid = bool(r and value is not None and r.get("is_valid", True))
+        return roi, r, value, valid
+
+    def refresh_excel_target(self):
+        try:
+            self.control_panel.show_excel_target(self.excel_link.target())
+        except ExcelError as e:
+            self.control_panel.show_excel_target(None, str(e))
+
+    def take_ablesung(self, slot: str):
+        """T0/T1: writes the scale value shown right now and the time of the press into the
+        row selected in Excel. Never overwrites; every press also goes into the backup CSV."""
+        when = datetime.now().replace(microsecond=0)
+        if not self.control_panel.scale_roi_combo.count():
+            self.control_panel.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
+        roi, r, value, valid = self._current_scale_reading()
+        mass_h, time_h = ("Masse_0", "Zeit_0") if slot == "T0" else ("Masse_1", "Zeit_1")
+        target, ok = None, False
+        if not valid:
+            result = (f"kein gültiger Waagenwert ({roi or 'kein Waagen-ROI'}) – nichts geschrieben, "
+                      f"Zeit war {when:%H:%M:%S}")
+        else:
+            try:
+                target = self.excel_link.write(slot, value, when)
+                ok = True
+                result = f"Zeile {target.row}: {mass_h} = {value:g}, {time_h} = {when:%H:%M:%S}"
+            except ExcelError as e:
+                result = f"{e} (Wert {value:g}, Zeit {when:%H:%M:%S})"
+
         ts = r.get("timestamp") if r else None
         try:
-            entry = self.ablesung_log.record(
-                value=value,
-                valid=valid,
+            self.ablesung_log.record(
+                slot=slot, value=value, valid=valid, when=when,
+                result=("OK " if ok else "NICHT GESCHRIEBEN: ") + result,
                 raw_text=str(r.get("raw_text", "")) if r else "",
-                roi=roi,
-                run_id=self.db_writer.current_run_id,
+                roi=roi, run_id=self.db_writer.current_run_id,
                 reading_time=datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else None,
+                workbook=target.workbook if target else "",
+                sheet=target.sheet if target else "",
+                row=target.row if target else None,
             )
         except OSError as e:
-            QMessageBox.critical(self, "Ablesung nicht gespeichert",
-                                 f"Die Ablesung konnte nicht gespeichert werden:\n{e}\n\nBitte von Hand notieren.")
-            return
-        xlsx_ok = self.ablesung_log.write_xlsx()
-        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
+            result += f" – Sicherungs-CSV nicht geschrieben: {e}"
 
-        shown = "kein Wert" if value is None else f"{value:g}"
-        msg = f"{entry.slot} = {shown}  um {entry.when:%H:%M:%S}"
-        if not valid:
-            msg += f"  – ACHTUNG: kein gültiger Waagenwert ({roi or 'kein ROI'}), Zeit ist gespeichert"
-        if not xlsx_ok:
-            msg += "  – Excel-Datei ist geöffnet, wird beim nächsten Klick nachgetragen (CSV ist gespeichert)"
-        self.control_panel.set_ablesung_status(msg, ok=valid and xlsx_ok)
-        self.statusBar().showMessage(msg, 10000)
+        if ok:
+            self._flashed += self.excel_link.flash(target, slot)
+            self._unflash_timer.start()
+        self._beep(ok)
+        text = f"{'✓' if ok else '⚠'} {slot} {when:%H:%M:%S}  {result}"
+        self.control_panel.set_ablesung_status(text, ok=ok)
+        self.control_panel.add_ablesung_history(text)
+        self.statusBar().showMessage(text, 10000)
+        self.refresh_excel_target()
 
-    def ablesung_new_row(self):
-        self.ablesung_log.start_new_row()
-        self.control_panel.show_ablesungen(self.ablesung_log.steps(), self.ablesung_log.next_slot)
+    def _unflash(self):
+        self._flashed = self.excel_link.unflash(self._flashed)
+        if not self._flashed:
+            self._unflash_timer.stop()
 
-    def open_ablesung_xlsx(self):
-        path = self.ablesung_log.xlsx_path
-        if not path.exists():
-            self.ablesung_log.write_xlsx()
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+    @staticmethod
+    def _beep(ok: bool):
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_OK if ok else winsound.MB_ICONHAND)
+        except Exception:
+            pass
 
     def on_readings_ready(self, readings, timestamp=None):
         self.control_panel.update_readings(readings)
         self.control_panel.set_scale_roi_names(
             list(dict.fromkeys(r["roi_name"] for r in readings if r.get("roi_name"))))
+        _roi, _r, value, valid = self._current_scale_reading()
+        self.control_panel.show_scale_value("–" if value is None else f"{value:g}", valid)
         self.video_widget.update_readings(readings)
 
         # Check if readings have timestamp or use parameter
@@ -970,6 +1041,10 @@ class MainWindow(QMainWindow):
 
         
     def closeEvent(self, event):
+        for hk_id in getattr(self, "_hotkey_slots", {}):
+            global_hotkeys.unregister(int(self.winId()), hk_id)
+        self._excel_poll.stop()
+        self._flashed = self.excel_link.unflash(self._flashed)
         if self.recorder.is_recording:
             self.recorder.stop_recording()
         if self.camera_thread:
