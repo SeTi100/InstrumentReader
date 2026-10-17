@@ -1,8 +1,54 @@
 # InstrumentReader
 
-Liest Laborgeräte (Waagen, Rotameter, 7-Segment-Anzeigen) per Kamera ab, erkennt
-die Werte mit OCR und loggt sie live in eine SQLite-Datenbank. Aufnahmen lassen
-sich später offline mit derselben Zeitachse auswerten.
+**Laborgeräte per Kamera ablesen, statt Werte von Hand abzuschreiben.**
+InstrumentReader erkennt Waagen, 7-Segment-Anzeigen und Rotameter im Kamerabild,
+liest die Werte mit OCR bzw. Bilderkennung und loggt sie live in eine
+SQLite-Datenbank. Aufnahmen lassen sich später offline mit derselben Zeitachse
+auswerten.
+
+![Hauptfenster: Kamerabild mit markierten Messbereichen für Waage, Rotameter und Temperaturregler, rechts die Bedienelemente](docs/images/hauptfenster.png)
+
+*Im Kamerabild markierte Messbereiche (ROIs): Waage und Temperaturregler werden per OCR gelesen,
+das Rotameter über die Lage des Schwimmers auf einer kalibrierten Skala. Rechts laufen die
+erkannten Werte live mit.*
+
+## Wofür?
+
+- **Langzeitmessungen ohne Datenlogger-Schnittstelle:** Ältere Waagen, Regler oder Anzeigen
+  ohne PC-Anschluss werden einfach abgefilmt. Die Werte landen mit Zeitstempel in der Datenbank.
+- **Verdampfungs- und Massenstromversuche:** Aus dem Waagensignal rechnet die App z. B. den
+  Massenstrom in g/h. Stufenwechsel (Nachfüllen, Umsetzen) erkennt sie und rechnet sie heraus.
+- **Gasdurchfluss am Rotameter:** Schwimmerposition entlang eines frei drehbaren Lineals, mit
+  eigener Kalibrierung.
+- **Laborjournal in Excel:** Mit F9/F10 Waagenwert und Uhrzeit direkt in die offene Zeile
+  des Labjournals schreiben.
+- **Nachträgliche Auswertung:** Ein aufgenommenes Video wird mit bis zu 10-facher Geschwindigkeit
+  oder „so schnell wie möglich“ nachgelesen, die Zeitachse stimmt trotzdem.
+
+<table>
+  <tr>
+    <td width="36%"><img src="docs/images/messwerte.png" alt="Live-Messwerte und berechneter Massenstrom"></td>
+    <td>
+      <b>Live-Werte und Rechenkanäle</b><br>
+      Jede ROI erscheint mit Wert, Einheit, OCR-Konfidenz und Plausibilitätsstatus. ROIs lassen
+      sich per Drag &amp; Drop in Formeln ziehen, z.&nbsp;B. <code>rate(m, 30) * 3600</code> für den
+      Massenstrom in g/h.
+      <br><br>
+      <b>Vorverarbeitung pro Messbereich</b><br>
+      Schwellwert, Kontrast, Morphologie, Drehung und Masken lassen sich pro ROI einstellen, mit
+      Vorschau bis auf Pixelebene:
+      <br><br>
+      <img src="docs/images/vorverarbeitung.png" alt="Vorverarbeitungsdialog mit binarisierter 7-Segment-Anzeige">
+    </td>
+  </tr>
+</table>
+
+**Experimente und Runs im Dashboard:** Messungen sind in Experimente und Runs gegliedert, mit
+frei wählbaren Parametern wie Temperatur oder Volumenstrom. Das Dashboard zeigt Dauer,
+Anzahl Messwerte und eine Vorschau, setzt beendete Runs fort und exportiert mehrere Runs
+gemeinsam als CSV.
+
+![Runs Dashboard mit drei Runs eines Verdampfungsexperiments](docs/images/runs-dashboard.png)
 
 ## Installation und Start
 
@@ -154,3 +200,6 @@ Zeitmessung: `python scripts/benchmark_ocr.py`
 | `INSTRUMENT_READER_EXCEL` | `0`: keine Excel-Anbindung, F9/F10 nicht systemweit |
 
 Änderungen stehen in [CHANGELOG.md](CHANGELOG.md).
+
+Die Bilder in dieser README zeigen die echte Oberfläche mit einer künstlichen Laborszene und
+Beispieldaten. Neu erzeugen: `uv run python scripts/readme_screenshots.py`.
