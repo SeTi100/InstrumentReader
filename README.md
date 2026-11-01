@@ -20,8 +20,8 @@ erkannten Werte live mit.*
   Massenstrom in g/h. Stufenwechsel (Nachfüllen, Umsetzen) erkennt sie und rechnet sie heraus.
 - **Gasdurchfluss am Rotameter:** Schwimmerposition entlang eines frei drehbaren Lineals, mit
   eigener Kalibrierung.
-- **Laborjournal in Excel:** Mit F9/F10 Waagenwert und Uhrzeit direkt in die offene Zeile
-  des Labjournals schreiben.
+- **Laborjournal in Excel:** Mit F9/F10 beliebige Live-Werte (z. B. Waage und Temperatur)
+  samt Uhrzeit direkt in die offene Zeile des Labjournals schreiben.
 - **Nachträgliche Auswertung:** Ein aufgenommenes Video wird mit bis zu 10-facher Geschwindigkeit
   oder „so schnell wie möglich“ nachgelesen, die Zeitachse stimmt trotzdem.
 
@@ -49,6 +49,20 @@ Anzahl Messwerte und eine Vorschau, setzt beendete Runs fort und exportiert mehr
 gemeinsam als CSV.
 
 ![Runs Dashboard mit drei Runs eines Verdampfungsexperiments](docs/images/runs-dashboard.png)
+
+<table>
+  <tr>
+    <td width="45%"><img src="docs/images/ablesung.png" alt="Ablesung-Panel: T0 schreibt Waage, Temperatur und Zeit, T1 Waage und Zeit ins Labjournal"></td>
+    <td>
+      <b>Ablesung ins Excel-Labjournal</b><br>
+      Pro Taste (T0 = F9, T1 = F10) legst du fest, welche Live-Readings in welche Spalte
+      geschrieben werden, plus eine Spalte für die Uhrzeit. Spalten gehen per Überschrift
+      (<code>Masse_0</code>) oder Buchstabe (<code>D</code>). Oben steht, in welche Zeile der
+      nächste Tastendruck schreibt und welche Zellen dort noch leer sind; darunter die letzten
+      Ablesungen.
+    </td>
+  </tr>
+</table>
 
 ## Installation und Start
 
@@ -84,11 +98,19 @@ uv run --extra dev pytest
   freigeschaltet werden.
 
 - **Ablesung → Labjournal:** Labjournal in Excel öffnen, Cursor in die Zeile des Messschritts
-  setzen, Waagen-ROI wählen. **F9 (T0)** schreibt Waagenwert und Uhrzeit in Masse_0/Zeit_0,
-  **F10 (T1)** in Masse_1/Zeit_1 dieser Zeile. Die Tasten gehen auch, wenn Excel vorne ist.
-  Belegte Zellen werden nie überschrieben; das Panel zeigt vorher, wohin geschrieben wird.
-  Jeder Tastendruck steht zusätzlich in `ablesungen/Ablesungen_<Datum>.csv`.
-  `INSTRUMENT_READER_EXCEL=0` schaltet die Excel-Anbindung und die Tasten ab.
+  setzen. **F9 (T0)** und **F10 (T1)** schreiben die eingestellten Werte und die Uhrzeit in
+  diese Zeile. Die Tasten gehen auch, wenn Excel vorne ist.
+  - *Was geschrieben wird:* Pro Taste beliebig viele Zeilen „Live-Reading → Spalte“
+    (*+ Wert* fügt eine hinzu, *×* entfernt sie) und eine Zeit-Spalte (leer = keine Zeit).
+    Spalte = Überschrift im Labjournal oder Spaltenbuchstabe. *Blatt* begrenzt das Schreiben
+    auf ein Blatt (leer = aktives Blatt). *Standard* setzt zurück auf
+    T0: Waage → Masse_0, Zeit_0 und T1: Waage → Masse_1, Zeit_1.
+    Die Einstellung wird bei jeder Änderung gespeichert.
+  - *Alles oder nichts:* Ist einer der Werte ungültig, wird für diesen Tastendruck nichts
+    geschrieben. Belegte Zellen werden nie überschrieben; das Panel zeigt vorher, wohin
+    geschrieben wird.
+  - Jeder Tastendruck steht zusätzlich in `ablesungen/Ablesungen_<Datum>.csv`.
+    `INSTRUMENT_READER_EXCEL=0` schaltet die Excel-Anbindung und die Tasten ab.
 
 Alle Daten liegen im Datenordner, siehe [Datensicherheit](#datensicherheit).
 
