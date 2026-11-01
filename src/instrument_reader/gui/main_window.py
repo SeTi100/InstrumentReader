@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from instrument_reader.core import data_safety
 from instrument_reader.core.ablesung import AblesungLog
-from instrument_reader.core.excel_link import ExcelError, ExcelLink
+from instrument_reader.core.excel_link import SLOTS, ExcelError, ExcelLink, load_columns, save_columns
 from instrument_reader.gui import global_hotkeys
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
@@ -184,7 +184,9 @@ class MainWindow(QMainWindow):
 
         # Manual readings (Ablesung): T0/T1 write into the row selected in the open Excel journal
         self.ablesung_log = AblesungLog(data_safety.data_dir() / "ablesungen")
-        self.excel_link = ExcelLink()
+        self.excel_link = ExcelLink(columns=load_columns(self._settings_file()))
+        self.control_panel.set_excel_columns(self.excel_link.columns)
+        self.control_panel.excel_columns_changed.connect(self.on_excel_columns_changed)
         self.control_panel.t0_btn.clicked.connect(lambda: self.take_ablesung("T0"))
         self.control_panel.t1_btn.clicked.connect(lambda: self.take_ablesung("T1"))
         self._flashed = []
@@ -670,9 +672,24 @@ class MainWindow(QMainWindow):
         valid = bool(r and value is not None and r.get("is_valid", True))
         return roi, r, value, valid
 
+    @staticmethod
+    def _settings_file():
+        return data_safety.data_dir() / "settings.json"
+
+    def on_excel_columns_changed(self, columns):
+        """New sheet/column names from the panel: used from the next press on and kept for
+        the next start."""
+        self.excel_link.columns = columns
+        try:
+            save_columns(self._settings_file(), columns)
+        except OSError as e:
+            self.statusBar().showMessage(f"Excel-Ziel nicht gespeichert: {e}", 10000)
+        if self._excel_poll.isActive():
+            self.refresh_excel_target()
+
     def refresh_excel_target(self):
         try:
-            self.control_panel.show_excel_target(self.excel_link.target())
+            self.control_panel.show_excel_target(self.excel_link.target(), columns=self.excel_link.columns)
         except ExcelError as e:
             self.control_panel.show_excel_target(None, str(e))
 
@@ -683,7 +700,8 @@ class MainWindow(QMainWindow):
         if not self.control_panel.scale_roi_combo.count():
             self.control_panel.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
         roi, r, value, valid = self._current_scale_reading()
-        mass_h, time_h = ("Masse_0", "Zeit_0") if slot == "T0" else ("Masse_1", "Zeit_1")
+        columns = self.excel_link.columns
+        mass_h, time_h = (columns.label(r) for r in SLOTS[slot])
         target, ok = None, False
         if not valid:
             result = (f"kein gültiger Waagenwert ({roi or 'kein Waagen-ROI'}) – nichts geschrieben, "

@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QListWidget, QLabel,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QLineEdit, QScrollArea, QDialog, QDialogButtonBox,
-    QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame, QCheckBox
+    QComboBox, QRadioButton, QButtonGroup, QMessageBox, QFrame, QCheckBox, QGridLayout
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QMimeData, QByteArray, QRectF
 from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
@@ -14,6 +14,7 @@ from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 from instrument_reader.core.camera_devices import (
     label_name, list_cameras, parse_source, windows_listing_incomplete,
 )
+from instrument_reader.core.excel_link import ExcelColumns, TIME_ROLES
 from instrument_reader.core.calculation import (
     CalculationChannel,
     CalculationResult,
@@ -660,6 +661,7 @@ class ControlPanel(QWidget):
     calc_channel_updated = Signal(object)
     calc_channel_deleted = Signal(str)
     stage_reset_requested = Signal()
+    excel_columns_changed = Signal(object)  # ExcelColumns
     # Emitted after every camera list refresh: list[CameraDevice], or None if unknown.
     cameras_changed = Signal(object)
 
@@ -874,9 +876,40 @@ class ControlPanel(QWidget):
         self.excel_target_label.setStyleSheet("padding: 4px; border: 1px solid #999; border-radius: 3px;")
         abl_layout.addWidget(self.excel_target_label)
 
+        # Where T0/T1 write: header names or column letters, freely editable, saved on change
+        col_tip = ("Spaltenüberschrift in Excel (z. B. Masse_0) oder Spaltenbuchstabe (z. B. D). "
+                   "Gibt es eine Überschrift mit genau diesem Namen, gilt die Überschrift.")
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.addWidget(QLabel("Blatt:"), 0, 0)
+        self.excel_sheet_edit = QLineEdit()
+        self.excel_sheet_edit.setPlaceholderText("aktives Blatt")
+        self.excel_sheet_edit.setToolTip("Nur auf dieses Excel-Blatt schreiben. Leer = das Blatt, "
+                                         "auf dem in Excel gerade der Cursor steht.")
+        grid.addWidget(self.excel_sheet_edit, 0, 1, 1, 4)
+        self.excel_defaults_btn = QPushButton("Standard")
+        self.excel_defaults_btn.setToolTip("Setzt Blatt und Spalten auf die Standardwerte zurück.")
+        grid.addWidget(self.excel_defaults_btn, 0, 5)
+        self.excel_col_edits: Dict[str, QLineEdit] = {}
+        for r, (slot, key_name, mass_key, time_key) in enumerate(
+                (("T0", "F9", "mass0", "time0"), ("T1", "F10", "mass1", "time1")), start=1):
+            grid.addWidget(QLabel(f"{slot} [{key_name}]:"), r, 0)
+            for c, (key, text) in enumerate(((mass_key, "Masse"), (time_key, "Zeit"))):
+                grid.addWidget(QLabel(text), r, 1 + 2 * c)
+                edit = QLineEdit()
+                edit.setToolTip(col_tip)
+                grid.addWidget(edit, r, 2 + 2 * c, 1, 2 if c else 1)
+                self.excel_col_edits[key] = edit
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(4, 1)
+        abl_layout.addLayout(grid)
+        for edit in (self.excel_sheet_edit, *self.excel_col_edits.values()):
+            edit.editingFinished.connect(self._emit_excel_columns)
+        self.excel_defaults_btn.clicked.connect(self._reset_excel_columns)
+
         t_row = QHBoxLayout()
-        self.t0_btn = QPushButton("T0 → Masse_0 + Zeit_0   [F9]")
-        self.t1_btn = QPushButton("T1 → Masse_1 + Zeit_1   [F10]")
+        self.t0_btn = QPushButton()
+        self.t1_btn = QPushButton()
         for b in (self.t0_btn, self.t1_btn):
             b.setMinimumHeight(40)
             b.setStyleSheet("font-weight: bold;")
@@ -892,6 +925,7 @@ class ControlPanel(QWidget):
         self.ablesung_history.setMaximumHeight(90)
         abl_layout.addWidget(self.ablesung_history)
         layout.addWidget(abl_group)
+        self.set_excel_columns(ExcelColumns())
 
         # Readings Table (Draggable)
         layout.addWidget(QLabel("<b>Live Readings (Drag ROIs to calculations):</b>"))
@@ -1011,28 +1045,60 @@ class ControlPanel(QWidget):
         self.scale_roi_combo.setCurrentText(selected)
         self.scale_roi_combo.blockSignals(False)
 
-    def show_excel_target(self, target, error: str = "") -> None:
+    def excel_columns(self) -> ExcelColumns:
+        """What is entered in the Blatt/column fields right now."""
+        return ExcelColumns(sheet=self.excel_sheet_edit.text().strip(),
+                            **{k: e.text().strip() for k, e in self.excel_col_edits.items()})
+
+    def set_excel_columns(self, columns: ExcelColumns) -> None:
+        """Fills the fields (without emitting a change) and labels the T0/T1 buttons."""
+        self.excel_sheet_edit.setText(columns.sheet)
+        for key, edit in self.excel_col_edits.items():
+            edit.setText(getattr(columns, key))
+        self._last_excel_columns = columns
+        self._label_ablesung_buttons(columns)
+
+    def _label_ablesung_buttons(self, columns: ExcelColumns) -> None:
+        self.t0_btn.setText(f"T0 → {columns.label('Masse_0')} + {columns.label('Zeit_0')}   [F9]")
+        self.t1_btn.setText(f"T1 → {columns.label('Masse_1')} + {columns.label('Zeit_1')}   [F10]")
+
+    def _emit_excel_columns(self) -> None:
+        columns = self.excel_columns()
+        if columns == self._last_excel_columns:
+            return
+        self._last_excel_columns = columns
+        self._label_ablesung_buttons(columns)
+        self.excel_columns_changed.emit(columns)
+
+    def _reset_excel_columns(self) -> None:
+        self.set_excel_columns(ExcelColumns())
+        self.excel_columns_changed.emit(self._last_excel_columns)
+
+    def show_excel_target(self, target, error: str = "", columns: Optional[ExcelColumns] = None) -> None:
         """Shows where T0/T1 would write right now (or why they can't)."""
         if error:
             self.excel_target_label.setText(f"<b>Ziel:</b> <span style='color:#c62828'>{html.escape(error)}</span>")
             return
+        columns = columns or self.excel_columns()
 
-        def cell(name):
-            v = target.values.get(name)
+        def cell(role):
+            v = target.values.get(role)
             if v is None or (isinstance(v, str) and not v.strip()):
-                return "<span style='color:#2e7d32'>leer</span>"
-            if name.startswith("Zeit") and isinstance(v, float) and 0 <= v < 1:
-                s = round(v * 86400)
-                v = f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
-            elif isinstance(v, float):
-                v = f"{v:g}"
-            return f"<b>{html.escape(str(v))}</b>"
+                value = "<span style='color:#2e7d32'>leer</span>"
+            else:
+                if role in TIME_ROLES and isinstance(v, float) and 0 <= v < 1:
+                    s = round(v * 86400)
+                    v = f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+                elif isinstance(v, float):
+                    v = f"{v:g}"
+                value = f"<b>{html.escape(str(v))}</b>"
+            return f"{html.escape(columns.label(role))} {value}"
 
         ctx = f" ({html.escape(target.context)})" if target.context else ""
         self.excel_target_label.setText(
             f"<b>Ziel:</b> {html.escape(target.workbook)} › {html.escape(target.sheet)} › <b>Zeile {target.row}</b>{ctx}<br>"
-            f"T0: Masse_0 {cell('Masse_0')}, Zeit_0 {cell('Zeit_0')} &nbsp;|&nbsp; "
-            f"T1: Masse_1 {cell('Masse_1')}, Zeit_1 {cell('Zeit_1')}")
+            f"T0: {cell('Masse_0')}, {cell('Zeit_0')} &nbsp;|&nbsp; "
+            f"T1: {cell('Masse_1')}, {cell('Zeit_1')}")
 
     def show_scale_value(self, text: str, ok: bool) -> None:
         self.scale_value_label.setText(f"Waage: {text}")
