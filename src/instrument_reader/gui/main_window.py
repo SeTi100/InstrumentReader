@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from instrument_reader.core import data_safety
 from instrument_reader.core.ablesung import AblesungLog
-from instrument_reader.core.excel_link import SLOTS, ExcelError, ExcelLink, load_columns, save_columns
+from instrument_reader.core.excel_link import ExcelError, ExcelLink, load_config, save_config
 from instrument_reader.gui import global_hotkeys
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
@@ -184,9 +184,9 @@ class MainWindow(QMainWindow):
 
         # Manual readings (Ablesung): T0/T1 write into the row selected in the open Excel journal
         self.ablesung_log = AblesungLog(data_safety.data_dir() / "ablesungen")
-        self.excel_link = ExcelLink(columns=load_columns(self._settings_file()))
-        self.control_panel.set_excel_columns(self.excel_link.columns)
-        self.control_panel.excel_columns_changed.connect(self.on_excel_columns_changed)
+        self.excel_link = ExcelLink(config=load_config(self._settings_file()))
+        self.control_panel.set_ablesung_config(self.excel_link.config)
+        self.control_panel.ablesung_config_changed.connect(self.on_ablesung_config_changed)
         self.control_panel.t0_btn.clicked.connect(lambda: self.take_ablesung("T0"))
         self.control_panel.t1_btn.clicked.connect(lambda: self.take_ablesung("T1"))
         self._flashed = []
@@ -665,23 +665,23 @@ class MainWindow(QMainWindow):
             return True, 0
         return super().nativeEvent(event_type, message)
 
-    def _current_scale_reading(self):
-        roi = self.control_panel.scale_roi_combo.currentText()
+    def _reading(self, roi: str):
+        """(reading dict, value, valid) of the live reading named roi."""
         r = next((x for x in self.video_widget.latest_readings if x.get("roi_name") == roi), None)
         value = r.get("parsed_value") if r else None
         valid = bool(r and value is not None and r.get("is_valid", True))
-        return roi, r, value, valid
+        return r, value, valid
 
     @staticmethod
     def _settings_file():
         return data_safety.data_dir() / "settings.json"
 
-    def on_excel_columns_changed(self, columns):
-        """New sheet/column names from the panel: used from the next press on and kept for
-        the next start."""
-        self.excel_link.columns = columns
+    def on_ablesung_config_changed(self, config):
+        """New sheet/columns/readings from the panel: used from the next press on and kept
+        for the next start."""
+        self.excel_link.config = config
         try:
-            save_columns(self._settings_file(), columns)
+            save_config(self._settings_file(), config)
         except OSError as e:
             self.statusBar().showMessage(f"Excel-Ziel nicht gespeichert: {e}", 10000)
         if self._excel_poll.isActive():
@@ -689,45 +689,61 @@ class MainWindow(QMainWindow):
 
     def refresh_excel_target(self):
         try:
-            self.control_panel.show_excel_target(self.excel_link.target(), columns=self.excel_link.columns)
+            self.control_panel.show_excel_target(self.excel_link.target(), config=self.excel_link.config)
         except ExcelError as e:
             self.control_panel.show_excel_target(None, str(e))
 
     def take_ablesung(self, slot: str):
-        """T0/T1: writes the scale value shown right now and the time of the press into the
-        row selected in Excel. Never overwrites; every press also goes into the backup CSV."""
+        """T0/T1: writes the configured live readings as shown right now and the time of the
+        press into the row selected in Excel. All or nothing: if one reading is invalid,
+        nothing is written. Never overwrites; every value also goes into the backup CSV."""
         when = datetime.now().replace(microsecond=0)
-        if not self.control_panel.scale_roi_combo.count():
-            self.control_panel.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
-        roi, r, value, valid = self._current_scale_reading()
-        columns = self.excel_link.columns
-        mass_h, time_h = (columns.label(r) for r in SLOTS[slot])
+        cp = self.control_panel
+        if not cp._roi_names:
+            cp.set_scale_roi_names([x.name for x in self.video_widget.rois if x.name])
+        sc = self.excel_link.config.slots[slot]
+        picked = []  # (roi, column, reading, value, valid)
+        for vc in sc.values:
+            roi = cp.resolve_roi(vc.roi)
+            r, value, valid = self._reading(roi)
+            picked.append((roi, vc.column, r, value, valid))
+        invalid = [p for p in picked if not p[4]]
         target, ok = None, False
-        if not valid:
-            result = (f"kein gültiger Wert ({roi or 'kein Live-Reading gewählt'}) – nichts geschrieben, "
-                      f"Zeit war {when:%H:%M:%S}")
+        if not picked:
+            result = f"für {slot} ist kein Wert eingestellt – nichts geschrieben"
+        elif invalid:
+            names = ", ".join(p[0] or "kein Live-Reading" for p in invalid)
+            result = f"kein gültiger Wert ({names}) – nichts geschrieben, Zeit war {when:%H:%M:%S}"
         else:
             try:
-                target = self.excel_link.write(slot, value, when)
+                target = self.excel_link.write(slot, [(col, value) for _roi, col, _r, value, _v in picked], when)
                 ok = True
-                result = f"Zeile {target.row}: {mass_h} = {value:g}, {time_h} = {when:%H:%M:%S}"
+                written = [f"{col} = {value:g}" for _roi, col, _r, value, _v in picked]
+                if sc.time.strip():
+                    written.append(f"{sc.time.strip()} = {when:%H:%M:%S}")
+                result = f"Zeile {target.row}: " + ", ".join(written)
             except ExcelError as e:
-                result = f"{e} (Wert {value:g}, Zeit {when:%H:%M:%S})"
+                values = ", ".join(f"{roi} {value:g}" for roi, _c, _r, value, _v in picked)
+                result = f"{e} ({values}, Zeit {when:%H:%M:%S})"
 
-        ts = r.get("timestamp") if r else None
-        try:
-            self.ablesung_log.record(
-                slot=slot, value=value, valid=valid, when=when,
-                result=("OK " if ok else "NICHT GESCHRIEBEN: ") + result,
-                raw_text=str(r.get("raw_text", "")) if r else "",
-                roi=roi, run_id=self.db_writer.current_run_id,
-                reading_time=datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else None,
-                workbook=target.workbook if target else "",
-                sheet=target.sheet if target else "",
-                row=target.row if target else None,
-            )
-        except OSError as e:
-            result += f" – Sicherungs-CSV nicht geschrieben: {e}"
+        log_error = None
+        for roi, _col, r, value, valid in picked or [("", "", None, None, False)]:
+            ts = r.get("timestamp") if r else None
+            try:
+                self.ablesung_log.record(
+                    slot=slot, value=value, valid=valid, when=when,
+                    result=("OK " if ok else "NICHT GESCHRIEBEN: ") + result,
+                    raw_text=str(r.get("raw_text", "")) if r else "",
+                    roi=roi, run_id=self.db_writer.current_run_id,
+                    reading_time=datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else None,
+                    workbook=target.workbook if target else "",
+                    sheet=target.sheet if target else "",
+                    row=target.row if target else None,
+                )
+            except OSError as e:
+                log_error = e
+        if log_error is not None:
+            result += f" – Sicherungs-CSV nicht geschrieben: {log_error}"
 
         if ok:
             self._flashed += self.excel_link.flash(target, slot)
@@ -756,8 +772,9 @@ class MainWindow(QMainWindow):
         self.control_panel.update_readings(readings)
         self.control_panel.set_scale_roi_names(
             list(dict.fromkeys(r["roi_name"] for r in readings if r.get("roi_name"))))
-        _roi, _r, value, valid = self._current_scale_reading()
-        self.control_panel.show_scale_value("–" if value is None else f"{value:g}", valid)
+        self.control_panel.update_ablesung_values({
+            r["roi_name"]: (r.get("parsed_value"), r.get("parsed_value") is not None and r.get("is_valid", True))
+            for r in readings if r.get("roi_name")})
         self.video_widget.update_readings(readings)
 
         # Check if readings have timestamp or use parameter

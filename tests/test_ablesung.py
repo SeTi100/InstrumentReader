@@ -4,7 +4,8 @@ import pytest
 
 from instrument_reader.core.ablesung import AblesungLog
 from instrument_reader.core.excel_link import (
-    ExcelError, ExcelLink, FLASH_COLOR, XL_NONE, find_columns, format_context, time_fraction,
+    FLASH_COLOR, XL_NONE, AblesungConfig, ExcelError, ExcelLink, SlotConfig, ValueColumn,
+    column_index, find_columns, find_context, format_context, load_config, save_config, time_fraction,
 )
 
 WHEN = datetime(2026, 10, 15, 10, 8, 56)
@@ -12,8 +13,9 @@ HEADERS = ["Temperatur", "V_MFC [Nl/min]", "Masse_0", "Masse_1", "Zeit_0", "Zeit
 
 
 def test_find_columns_by_header_with_offset():
-    cols = find_columns(HEADERS, first_col=2)  # table starts in column B like the journal
-    assert cols == {"Temperatur": 2, "V_MFC": 3, "Masse_0": 4, "Masse_1": 5, "Zeit_0": 6, "Zeit_1": 7}
+    cols = find_columns(HEADERS, 2, AblesungConfig().columns())  # table starts in column B like the journal
+    assert cols == {"Masse_0": 4, "Masse_1": 5, "Zeit_0": 6, "Zeit_1": 7}
+    assert find_context(HEADERS, 2) == {"Temperatur": 2, "V_MFC": 3}
 
 
 def test_context_and_time():
@@ -67,16 +69,16 @@ def test_writes_into_active_row_and_never_overwrites(excel):
     assert (t.sheet, t.row, t.context) == ("15.10.2026", 11, "250 °C · 20 Nl/min")
     assert t.filled("T0") == []
 
-    link.write("T0", 9657.45, WHEN)
+    link.write("T0", [("Masse_0", 9657.45)], WHEN)
     assert ws.Cells(11, 4).Value == 9657.45
     assert round(ws.Cells(11, 6).Value2 * 86400) == 10 * 3600 + 8 * 60 + 56
     assert ws.Cells(11, 6).Text == "10:08:56"
 
     with pytest.raises(ExcelError, match="schon belegt"):
-        link.write("T0", 1.0, WHEN)  # double press
+        link.write("T0", [("Masse_0", 1.0)], WHEN)  # double press
     assert ws.Cells(11, 4).Value == 9657.45
 
-    link.write("T1", 9655.86, datetime(2026, 10, 15, 10, 14, 40))
+    link.write("T1", [("Masse_1", 9655.86)], datetime(2026, 10, 15, 10, 14, 40))
     assert ws.Cells(11, 5).Value == 9655.86 and ws.Cells(11, 7).Text == "10:14:40"
 
 
@@ -84,7 +86,7 @@ def test_refuses_if_only_the_time_is_filled(excel):
     app, ws = excel
     ws.Cells(11, 6).Value2 = 0.5
     with pytest.raises(ExcelError, match="Zeit_0"):
-        ExcelLink(lambda: app).write("T0", 1.0, WHEN)
+        ExcelLink(lambda: app).write("T0", [("Masse_0", 1.0)], WHEN)
     assert ws.Cells(11, 4).Value is None
 
 
@@ -102,7 +104,7 @@ def test_refuses_header_row_and_unknown_sheet(excel):
 def test_flash_restores_fill(excel):
     app, ws = excel
     link = ExcelLink(lambda: app)
-    t = link.write("T0", 1.0, WHEN)
+    t = link.write("T0", [("Masse_0", 1.0)], WHEN)
     cells = link.flash(t, "T0")
     assert len(cells) == 2 and ws.Cells(11, 4).Interior.Color == FLASH_COLOR
     assert link.unflash(cells) == []
@@ -121,16 +123,15 @@ def test_no_excel_is_a_message():
 class FakeLink:
     def __init__(self):
         self.cells = {}
-        from instrument_reader.core.excel_link import ExcelColumns
-        self.columns = ExcelColumns()
+        self.config = AblesungConfig()
 
     def target(self):
         raise ExcelError("Excel ist nicht geöffnet")
 
-    def write(self, slot, value, when):
+    def write(self, slot, values, when):
         if slot in self.cells:
             raise ExcelError("Zeile 18: Masse_0 schon belegt – nichts geschrieben.")
-        self.cells[slot] = (value, when)
+        self.cells[slot] = (values, when)
         from instrument_reader.core.excel_link import Target
         return Target("J.xlsx", "S", 18, {})
 
@@ -152,11 +153,11 @@ def test_buttons_write_value_and_log_refusals(qtbot):
         {"roi_name": "Rotameter", "parsed_value": 3.0, "is_valid": True},
     ]
     w.control_panel.set_scale_roi_names(["Rotameter", "Waage"])
-    assert w.control_panel.scale_roi_combo.currentText() == "Waage"
+    assert w.control_panel.resolve_roi("") == "Waage"
 
     w.control_panel.t0_btn.click()
     w.control_panel.t0_btn.click()  # double press: refused, but logged
-    assert w.excel_link.cells["T0"][0] == 9657.8
+    assert w.excel_link.cells["T0"][0] == [("Masse_0", 9657.8)]
     assert w.control_panel.ablesung_history.count() == 2
     assert w.control_panel.ablesung_history.item(0).text().startswith("⚠ T0")
 
@@ -168,9 +169,7 @@ def test_buttons_write_value_and_log_refusals(qtbot):
     assert [r["Ergebnis"][:2] for r in rows] == ["OK", "NI", "NI"]
 
 
-# -- configurable target (sheet, header names or column letters) -------------------------------
-
-from instrument_reader.core.excel_link import ExcelColumns, column_index, load_columns, save_columns
+# -- configurable target (sheet, any number of readings, header names or column letters) -------
 
 
 class FakeCell:
@@ -238,91 +237,81 @@ def _sheet(headers, name="Tabelle1", header_row=1):
     return FakeSheet(name, {(header_row, 1 + i): h for i, h in enumerate(headers)})
 
 
+def _cfg(t0, t0_time="", t1=(), t1_time="", sheet=""):
+    return AblesungConfig(sheet=sheet, slots={
+        "T0": SlotConfig([ValueColumn(r, c) for r, c in t0], t0_time),
+        "T1": SlotConfig([ValueColumn(r, c) for r, c in t1], t1_time)})
+
+
 def test_column_letters():
     assert [column_index(x) for x in ("A", "d", "AA", "XFD", "Masse", "A1", "", "XFE")] == \
         [1, 4, 27, 16384, None, None, None, None]
 
 
-def test_custom_header_names():
-    ws = _sheet(["Zeit", "m0", "t0", "m1", "t1"])
-    cols = ExcelColumns(mass0="m0", time0="t0", mass1="M1", time1="t1")
-    link = ExcelLink(lambda: FakeApp(ws, 5), cols)
+def test_several_readings_with_one_press():
+    ws = _sheet(["Temperatur", "m0", "T_0", "t0", "m1", "t1"])
+    cfg = _cfg([("Waage", "m0"), ("Temperatur", "T_0")], "t0", [("Waage", "M1")], "t1")
+    link = ExcelLink(lambda: FakeApp(ws, 5), cfg)
     t = link.target()
-    assert t.cols == {"Masse_0": 2, "Zeit_0": 3, "Masse_1": 4, "Zeit_1": 5}
-    link.write("T1", 12.5, WHEN)
-    assert ws.data[(5, 4)] == 12.5
-    with pytest.raises(ExcelError, match="M1 und t1 schon belegt"):
-        link.write("T1", 1.0, WHEN)
+    assert t.cols == {"m0": 2, "T_0": 3, "t0": 4, "M1": 5, "t1": 6}
+    link.write("T0", [("m0", 84.5), ("T_0", 251.0)], WHEN)
+    assert (ws.data[(5, 2)], ws.data[(5, 3)]) == (84.5, 251.0)
+    assert round(ws.data[(5, 4)] * 86400) == 10 * 3600 + 8 * 60 + 56
+    with pytest.raises(ExcelError, match="m0, T_0, t0 schon belegt"):
+        link.write("T0", [("m0", 1.0), ("T_0", 1.0)], WHEN)
 
 
-def test_plain_column_letters_need_no_headers():
+def test_plain_column_letters_need_no_headers_and_time_is_optional():
     ws = FakeSheet("Leer", {})
-    link = ExcelLink(lambda: FakeApp(ws, 1), ExcelColumns(mass0="A", time0="B", mass1="C", time1="D"))
-    assert link.target().cols == {"Masse_0": 1, "Zeit_0": 2, "Masse_1": 3, "Zeit_1": 4}
-    link.write("T0", 3.0, WHEN)
-    assert ws.data[(1, 1)] == 3.0 and round(ws.data[(1, 2)] * 86400) == 10 * 3600 + 8 * 60 + 56
+    link = ExcelLink(lambda: FakeApp(ws, 1), _cfg([("", "A"), ("", "B"), ("", "C")], "", [("", "D")]))
+    assert link.target().cols == {"A": 1, "B": 2, "C": 3, "D": 4}
+    link.write("T0", [("A", 1.0), ("B", 2.0), ("C", 3.0)], WHEN)
+    assert ws.data == {(1, 1): 1.0, (1, 2): 2.0, (1, 3): 3.0}
 
 
 def test_letters_and_names_mixed_header_wins():
     ws = _sheet(["Masse_0", "x", "Zeit_0", "A"])
-    cols = ExcelColumns(mass0="Masse_0", time0="Zeit_0", mass1="A", time1="F")
-    t = ExcelLink(lambda: FakeApp(ws, 3), cols).target()
-    assert t.cols == {"Masse_0": 1, "Zeit_0": 3, "Masse_1": 4, "Zeit_1": 6}
+    cfg = _cfg([("", "Masse_0")], "Zeit_0", [("", "A")], "F")
+    t = ExcelLink(lambda: FakeApp(ws, 3), cfg).target()
+    assert t.cols == {"Masse_0": 1, "Zeit_0": 3, "A": 4, "F": 6}
     with pytest.raises(ExcelError, match="nicht gefunden"):  # cursor on the header row itself
-        ExcelLink(lambda: FakeApp(ws, 1), cols).target()
+        ExcelLink(lambda: FakeApp(ws, 1), cfg).target()
 
 
 def test_missing_names_are_reported_as_entered():
     ws = _sheet(["Masse_0"])
-    with pytest.raises(ExcelError, match="Spalten Gewicht, Zeit_0"):
-        ExcelLink(lambda: FakeApp(ws, 3), ExcelColumns(mass0="Gewicht", mass1="Masse_0", time1="C")).target()
+    with pytest.raises(ExcelError, match="Spalten Gewicht, Zeit_0 nicht gefunden"):
+        ExcelLink(lambda: FakeApp(ws, 3), _cfg([("", "Gewicht")], "Zeit_0", [("", "Masse_0")], "C")).target()
 
 
 def test_sheet_restriction_and_bad_config():
     ws = _sheet(["Masse_0", "Zeit_0", "Masse_1", "Zeit_1"], name="Tabelle1")
-    assert ExcelLink(lambda: FakeApp(ws, 2), ExcelColumns(sheet="tabelle1")).target().row == 2
+    assert ExcelLink(lambda: FakeApp(ws, 2), AblesungConfig(sheet="tabelle1")).target().row == 2
     with pytest.raises(ExcelError, match="Ziel ist Blatt „Messung“"):
-        ExcelLink(lambda: FakeApp(ws, 2), ExcelColumns(sheet="Messung")).target()
-    with pytest.raises(ExcelError, match="ist leer"):
-        ExcelLink(lambda: FakeApp(ws, 2), ExcelColumns(time1=" ")).target()
+        ExcelLink(lambda: FakeApp(ws, 2), AblesungConfig(sheet="Messung")).target()
+    with pytest.raises(ExcelError, match="T0: eine Spalte ist leer"):
+        ExcelLink(lambda: FakeApp(ws, 2), _cfg([("", " ")])).target()
     with pytest.raises(ExcelError, match="mehrfach"):
-        ExcelLink(lambda: FakeApp(ws, 2), ExcelColumns(mass0="A", time0="a")).target()
+        ExcelLink(lambda: FakeApp(ws, 2), _cfg([("", "A")], "a")).target()
 
 
-def test_settings_roundtrip_keeps_other_keys(tmp_path):
-    f = tmp_path / "settings.json"
-    assert load_columns(f) == ExcelColumns()
-    f.write_text('{"backup_mirror": "Z:/x", "excel_ziel": "kaputt"}', encoding="utf-8")
-    assert load_columns(f) == ExcelColumns()
-    save_columns(f, ExcelColumns(sheet="Tabelle1", mass0="A"))
-    assert load_columns(f) == ExcelColumns(sheet="Tabelle1", mass0="A")
+def test_settings_roundtrip_keeps_other_keys_and_reads_first_version(tmp_path):
     import json
+    f = tmp_path / "settings.json"
+    assert load_config(f) == AblesungConfig()
+    f.write_text('{"backup_mirror": "Z:/x", "excel_ziel": "kaputt"}', encoding="utf-8")
+    assert load_config(f) == AblesungConfig()
+    cfg = _cfg([("Waage", "A"), ("Temperatur", "B")], "C", [], "", sheet="Tabelle1")
+    save_config(f, cfg)
+    assert load_config(f) == cfg
     assert json.loads(f.read_text(encoding="utf-8"))["backup_mirror"] == "Z:/x"
+    # format of the first version of this branch: one value per key
+    f.write_text(json.dumps({"excel_ziel": {"roi": "Temperatur", "sheet": "", "mass0": "B",
+                                            "time0": "Zeit_0", "mass1": "Masse_1", "time1": ""}}))
+    assert load_config(f) == _cfg([("Temperatur", "B")], "Zeit_0", [("Temperatur", "Masse_1")], "")
 
 
-def test_fields_are_saved_and_label_buttons(qtbot):
-    from instrument_reader.core import data_safety
-    from instrument_reader.gui.main_window import MainWindow
-
-    w = MainWindow()
-    qtbot.addWidget(w)
-    cp = w.control_panel
-    assert cp.excel_col_edits["mass0"].text() == "Masse_0" and cp.excel_sheet_edit.text() == ""
-    assert cp.t0_btn.text().startswith("T0 → Masse_0 + Zeit_0")
-    cp.excel_col_edits["mass0"].setText("B")
-    cp.excel_col_edits["mass0"].editingFinished.emit()
-    assert w.excel_link.columns.mass0 == "B"
-    assert cp.t0_btn.text().startswith("T0 → B + Zeit_0")
-    assert load_columns(data_safety.data_dir() / "settings.json").mass0 == "B"
-
-    w2 = MainWindow()  # next start
-    qtbot.addWidget(w2)
-    assert w2.control_panel.excel_col_edits["mass0"].text() == "B"
-    w2.control_panel.excel_defaults_btn.click()
-    assert w2.excel_link.columns == ExcelColumns()
-
-
-def test_value_fields_follow_the_selected_live_reading(qtbot):
+def test_panel_rows_are_editable_and_saved(qtbot):
     from instrument_reader.core import data_safety
     from instrument_reader.gui.main_window import MainWindow
 
@@ -330,18 +319,40 @@ def test_value_fields_follow_the_selected_live_reading(qtbot):
     qtbot.addWidget(w)
     cp = w.control_panel
     cp.set_scale_roi_names(["Temperatur", "Waage"])
-    assert cp.scale_roi_combo.currentText() == "Waage"
-    assert [lbl.text() for lbl in cp.excel_value_labels] == ["Waage", "Waage"]
+    combo, edit, _lbl = cp._abl_rows["T0"][0]
+    assert (combo.currentText(), edit.text(), cp.excel_time_edits["T0"].text()) == ("Waage", "Masse_0", "Zeit_0")
+    assert cp.t0_btn.text().startswith("T0 → Masse_0, Zeit_0")
 
-    cp.scale_roi_combo.setCurrentText("Temperatur")  # user picks another reading
-    assert [lbl.text() for lbl in cp.excel_value_labels] == ["Temperatur", "Temperatur"]
-    cp.show_scale_value("251", True)
-    assert cp.scale_value_label.text() == "Temperatur: 251"
-    assert load_columns(data_safety.data_dir() / "settings.json").roi == "Temperatur"
+    cp._add_ablesung_row("T0")  # "+ Wert": the next unused reading
+    combo2, edit2, _ = cp._abl_rows["T0"][1]
+    assert combo2.currentText() == "Temperatur"
+    edit2.setText("Temp_0")
+    edit2.editingFinished.emit()
+    assert w.excel_link.config.slots["T0"].values == [ValueColumn("", "Masse_0"), ValueColumn("Temperatur", "Temp_0")]
+    assert cp.t0_btn.text().startswith("T0 → Masse_0, Temp_0, Zeit_0")
+    assert load_config(data_safety.data_dir() / "settings.json") == w.excel_link.config
 
-    w2 = MainWindow()  # next start: the saved reading wins over the 'Waage' default
+    cp.update_ablesung_values({"Waage": (84.5, True), "Temperatur": (251.0, False)})
+    assert [r[2].text() for r in cp._abl_rows["T0"]] == ["84.5", "251"]
+
+    w.excel_link = FakeLink()
+    w.excel_link.config = cp.ablesung_config()
+    w.video_widget.latest_readings = [
+        {"roi_name": "Waage", "parsed_value": 84.5, "is_valid": True},
+        {"roi_name": "Temperatur", "parsed_value": 251.0, "is_valid": True},
+    ]
+    cp.t0_btn.click()
+    assert w.excel_link.cells["T0"][0] == [("Masse_0", 84.5), ("Temp_0", 251.0)]
+    w.video_widget.latest_readings[1]["is_valid"] = False
+    cp.t1_btn.click()  # T1 only uses the scale: still fine
+    assert w.excel_link.cells["T1"][0] == [("Masse_1", 84.5)]
+
+    w2 = MainWindow()  # next start
     qtbot.addWidget(w2)
     w2.control_panel.set_scale_roi_names(["Waage", "Temperatur"])
-    assert w2.control_panel.scale_roi_combo.currentText() == "Temperatur"
-    w2.control_panel.excel_defaults_btn.click()  # Standard resets columns, keeps the reading
-    assert w2.excel_link.columns == ExcelColumns(roi="Temperatur")
+    rows = w2.control_panel._abl_rows["T0"]
+    assert [(c.currentText(), e.text()) for c, e, _ in rows] == [("Waage", "Masse_0"), ("Temperatur", "Temp_0")]
+    w2.control_panel._remove_ablesung_row("T0", rows[0][0])
+    assert w2.excel_link.config.slots["T0"].values == [ValueColumn("Temperatur", "Temp_0")]
+    w2.control_panel.excel_defaults_btn.click()
+    assert w2.excel_link.config == AblesungConfig()

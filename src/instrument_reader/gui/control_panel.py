@@ -1,3 +1,4 @@
+import copy
 import html
 import uuid
 from typing import Dict, List, Optional, Any
@@ -14,7 +15,7 @@ from PySide6.QtGui import QDrag, QFont, QPainter, QBrush, QColor, QPen
 from instrument_reader.core.camera_devices import (
     label_name, list_cameras, parse_source, windows_listing_incomplete,
 )
-from instrument_reader.core.excel_link import ExcelColumns, TIME_ROLES
+from instrument_reader.core.excel_link import SLOT_KEYS, AblesungConfig, ValueColumn
 from instrument_reader.core.calculation import (
     CalculationChannel,
     CalculationResult,
@@ -22,6 +23,10 @@ from instrument_reader.core.calculation import (
     get_standard_presets,
     CalculationEngine,
 )
+
+
+def _norm_col(name: str) -> str:
+    return str(name or "").strip().lower()
 
 
 class DraggableTableWidget(QTableWidget):
@@ -661,7 +666,7 @@ class ControlPanel(QWidget):
     calc_channel_updated = Signal(object)
     calc_channel_deleted = Signal(str)
     stage_reset_requested = Signal()
-    excel_columns_changed = Signal(object)  # ExcelColumns
+    ablesung_config_changed = Signal(object)  # AblesungConfig
     # Emitted after every camera list refresh: list[CameraDevice], or None if unknown.
     cameras_changed = Signal(object)
 
@@ -860,15 +865,6 @@ class ControlPanel(QWidget):
         # Manual readings: T0/T1 write scale value + time into the row selected in Excel
         abl_group = QGroupBox("Ablesung → Labjournal (Excel)")
         abl_layout = QVBoxLayout(abl_group)
-        roi_row = QHBoxLayout()
-        roi_row.addWidget(QLabel("Live-Reading:"))
-        self.scale_roi_combo = QComboBox()
-        self.scale_roi_combo.setToolTip("Dieser Messwert wird mit T0/T1 in Excel geschrieben.")
-        roi_row.addWidget(self.scale_roi_combo, 1)
-        self.scale_value_label = QLabel("Wert: –")
-        self.scale_value_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        roi_row.addWidget(self.scale_value_label)
-        abl_layout.addLayout(roi_row)
 
         self.excel_target_label = QLabel()
         self.excel_target_label.setWordWrap(True)
@@ -877,42 +873,59 @@ class ControlPanel(QWidget):
         self.excel_target_label.setStyleSheet("padding: 4px; border: 1px solid #999; border-radius: 3px;")
         abl_layout.addWidget(self.excel_target_label)
 
-        # Where T0/T1 write: header names or column letters, freely editable, saved on change
-        col_tip = ("Spaltenüberschrift in Excel (z. B. Masse_0) oder Spaltenbuchstabe (z. B. D). "
-                   "Gibt es eine Überschrift mit genau diesem Namen, gilt die Überschrift.")
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.addWidget(QLabel("Blatt:"), 0, 0)
+        # What a key press writes: per key any number of "live reading -> column" rows plus
+        # the time column. Freely editable, saved on every change.
+        sheet_row = QHBoxLayout()
+        sheet_row.addWidget(QLabel("Blatt:"))
         self.excel_sheet_edit = QLineEdit()
         self.excel_sheet_edit.setPlaceholderText("aktives Blatt")
         self.excel_sheet_edit.setToolTip("Nur auf dieses Excel-Blatt schreiben. Leer = das Blatt, "
                                          "auf dem in Excel gerade der Cursor steht.")
-        grid.addWidget(self.excel_sheet_edit, 0, 1, 1, 4)
+        self.excel_sheet_edit.editingFinished.connect(self._on_ablesung_edited)
+        sheet_row.addWidget(self.excel_sheet_edit, 1)
         self.excel_defaults_btn = QPushButton("Standard")
-        self.excel_defaults_btn.setToolTip("Setzt Blatt und Spalten auf die Standardwerte zurück.")
-        grid.addWidget(self.excel_defaults_btn, 0, 5)
-        self.excel_col_edits: Dict[str, QLineEdit] = {}
-        self.excel_value_labels: List[QLabel] = []  # named after the selected live reading
-        for r, (slot, key_name, mass_key, time_key) in enumerate(
-                (("T0", "F9", "mass0", "time0"), ("T1", "F10", "mass1", "time1")), start=1):
-            grid.addWidget(QLabel(f"{slot} [{key_name}]:"), r, 0)
-            for c, (key, text) in enumerate(((mass_key, "Wert"), (time_key, "Zeit"))):
-                lbl = QLabel(text)
-                if c == 0:
-                    self.excel_value_labels.append(lbl)
-                grid.addWidget(lbl, r, 1 + 2 * c)
-                edit = QLineEdit()
-                edit.setToolTip(col_tip)
-                grid.addWidget(edit, r, 2 + 2 * c, 1, 2 if c else 1)
-                self.excel_col_edits[key] = edit
-        grid.setColumnStretch(2, 1)
-        grid.setColumnStretch(4, 1)
-        abl_layout.addLayout(grid)
-        for edit in (self.excel_sheet_edit, *self.excel_col_edits.values()):
-            edit.editingFinished.connect(self._emit_excel_columns)
-        self.excel_defaults_btn.clicked.connect(self._reset_excel_columns)
-        self._preferred_roi = ""
-        self.scale_roi_combo.currentTextChanged.connect(self._on_scale_roi_changed)
+        self.excel_defaults_btn.setToolTip("Setzt Blatt und Spalten auf die Standardwerte zurück "
+                                           "(T0: Waage → Masse_0, Zeit_0; T1: Waage → Masse_1, Zeit_1).")
+        self.excel_defaults_btn.clicked.connect(self._reset_ablesung_config)
+        sheet_row.addWidget(self.excel_defaults_btn)
+        abl_layout.addLayout(sheet_row)
+
+        self._roi_names: List[str] = []
+        self._abl_config = AblesungConfig()
+        self._abl_rows: Dict[str, list] = {}  # slot -> [(combo, column edit, value label)]
+        self._abl_grids: Dict[str, QGridLayout] = {}
+        self.excel_time_edits: Dict[str, QLineEdit] = {}
+        for slot, key in SLOT_KEYS.items():
+            box = QFrame()
+            box.setFrameShape(QFrame.StyledPanel)
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(6, 4, 6, 4)
+            head = QHBoxLayout()
+            head.addWidget(QLabel(f"<b>{slot} [{key}]</b>"))
+            head.addStretch()
+            head.addWidget(QLabel("Zeit →"))
+            time_edit = QLineEdit()
+            time_edit.setPlaceholderText("keine Zeit")
+            time_edit.setToolTip("Spalte für die Uhrzeit des Tastendrucks. Leer = keine Zeit schreiben.")
+            time_edit.setMaximumWidth(130)
+            time_edit.editingFinished.connect(self._on_ablesung_edited)
+            head.addWidget(time_edit)
+            self.excel_time_edits[slot] = time_edit
+            box_layout.addLayout(head)
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setColumnStretch(0, 3)
+            grid.setColumnStretch(2, 2)
+            box_layout.addLayout(grid)
+            self._abl_grids[slot] = grid
+            add_btn = QPushButton("+ Wert")
+            add_btn.setToolTip(f"Noch einen Messwert mit {key} schreiben.")
+            add_btn.clicked.connect(lambda _=False, s=slot: self._add_ablesung_row(s))
+            add_row = QHBoxLayout()
+            add_row.addWidget(add_btn)
+            add_row.addStretch()
+            box_layout.addLayout(add_row)
+            abl_layout.addWidget(box)
 
         t_row = QHBoxLayout()
         self.t0_btn = QPushButton()
@@ -920,8 +933,8 @@ class ControlPanel(QWidget):
         for b in (self.t0_btn, self.t1_btn):
             b.setMinimumHeight(40)
             b.setStyleSheet("font-weight: bold;")
-            b.setToolTip("Schreibt den Wert des gewählten Live-Readings und die Uhrzeit in die Zeile, in der in Excel der Cursor steht. "
-                         "Belegte Zellen werden nie überschrieben.")
+            b.setToolTip("Schreibt die gewählten Live-Readings und die Uhrzeit in die Zeile, in der in Excel "
+                         "der Cursor steht. Belegte Zellen werden nie überschrieben.")
             t_row.addWidget(b)
         abl_layout.addLayout(t_row)
 
@@ -932,7 +945,7 @@ class ControlPanel(QWidget):
         self.ablesung_history.setMaximumHeight(90)
         abl_layout.addWidget(self.ablesung_history)
         layout.addWidget(abl_group)
-        self.set_excel_columns(ExcelColumns())
+        self.set_ablesung_config(AblesungConfig())
 
         # Readings Table (Draggable)
         layout.addWidget(QLabel("<b>Live Readings (Drag ROIs to calculations):</b>"))
@@ -1038,100 +1051,168 @@ class ControlPanel(QWidget):
             if item and item.text() == old_name:
                 item.setText(new_name)
 
+    # -- Ablesung (T0/T1 -> Excel) ----------------------------------------------------------
+
+    def resolve_roi(self, roi: str) -> str:
+        """The live reading a row stands for: its own choice, else (empty) the scale, i.e.
+        the first reading named like 'Waage', else the first one."""
+        if roi:
+            return roi
+        return next((n for n in self._roi_names if "waage" in n.lower()),
+                    self._roi_names[0] if self._roi_names else "")
+
     def set_scale_roi_names(self, names: List[str]) -> None:
-        """Offers the ROIs for the manual reading; keeps the choice, else the saved one, else
-        prefers a 'Waage'."""
-        current = [self.scale_roi_combo.itemText(i) for i in range(self.scale_roi_combo.count())]
-        if names == current:
+        """Offers the current live readings in every row's dropdown."""
+        if names == self._roi_names:
             return
-        selected = self.scale_roi_combo.currentText()
-        self.scale_roi_combo.blockSignals(True)
-        self.scale_roi_combo.clear()
-        self.scale_roi_combo.addItems(names)
-        if selected not in names:
-            selected = (self._preferred_roi if self._preferred_roi in names else
-                        next((n for n in names if "waage" in n.lower()), names[0] if names else ""))
-        self.scale_roi_combo.setCurrentText(selected)
-        self.scale_roi_combo.blockSignals(False)
-        self._label_value_fields()
+        self._roi_names = list(names)
+        for slot, rows in self._abl_rows.items():
+            for i, (combo, _edit, _lbl) in enumerate(rows):
+                self._fill_roi_combo(combo, self._abl_config.slots[slot].values[i].roi)
 
-    def _on_scale_roi_changed(self, name: str) -> None:
-        """The user picked another live reading: relabel and keep it for the next start."""
-        self._label_value_fields()
-        if name:
-            self._preferred_roi = name
-            self._emit_excel_columns()
+    def _fill_roi_combo(self, combo: QComboBox, roi: str) -> None:
+        shown = self.resolve_roi(roi)
+        items = list(self._roi_names)
+        if shown and shown not in items:
+            items.append(shown)  # saved reading that has no ROI (yet): keep showing it
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(items)
+        combo.setCurrentText(shown)
+        combo.blockSignals(False)
 
-    def _label_value_fields(self) -> None:
-        name = self.scale_roi_combo.currentText() or "Wert"
-        for lbl in self.excel_value_labels:
-            lbl.setText(name)
+    def ablesung_config(self) -> AblesungConfig:
+        return copy.deepcopy(self._abl_config)
 
-    def excel_columns(self) -> ExcelColumns:
-        """What is entered in the Blatt/column fields right now."""
-        return ExcelColumns(roi=self._preferred_roi, sheet=self.excel_sheet_edit.text().strip(),
-                            **{k: e.text().strip() for k, e in self.excel_col_edits.items()})
+    def set_ablesung_config(self, config: AblesungConfig) -> None:
+        """Shows the configuration (without emitting a change)."""
+        self._abl_config = copy.deepcopy(config)
+        self.excel_sheet_edit.setText(config.sheet)
+        for slot in SLOT_KEYS:
+            self.excel_time_edits[slot].setText(config.slots[slot].time)
+            self._rebuild_ablesung_rows(slot)
+        self._label_ablesung_buttons()
 
-    def set_excel_columns(self, columns: ExcelColumns) -> None:
-        """Fills the fields (without emitting a change) and labels the T0/T1 buttons."""
-        self._preferred_roi = columns.roi
-        if columns.roi and self.scale_roi_combo.findText(columns.roi) >= 0:
-            self.scale_roi_combo.blockSignals(True)
-            self.scale_roi_combo.setCurrentText(columns.roi)
-            self.scale_roi_combo.blockSignals(False)
-            self._label_value_fields()
-        self.excel_sheet_edit.setText(columns.sheet)
-        for key, edit in self.excel_col_edits.items():
-            edit.setText(getattr(columns, key))
-        self._last_excel_columns = columns
-        self._label_ablesung_buttons(columns)
+    def _rebuild_ablesung_rows(self, slot: str) -> None:
+        grid = self._abl_grids[slot]
+        while grid.count():
+            w = grid.takeAt(0).widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        rows = []
+        for i, vc in enumerate(self._abl_config.slots[slot].values):
+            combo = QComboBox()
+            combo.setToolTip("Dieser Live-Reading-Wert wird geschrieben.")
+            self._fill_roi_combo(combo, vc.roi)
+            combo.activated.connect(lambda _i, s=slot, c=combo: self._on_roi_picked(s, c))
+            edit = QLineEdit(vc.column)
+            edit.setPlaceholderText("Spalte")
+            edit.setToolTip("Spaltenüberschrift in Excel (z. B. Masse_0) oder Spaltenbuchstabe (z. B. D). "
+                            "Gibt es eine Überschrift mit genau diesem Namen, gilt die Überschrift.")
+            edit.editingFinished.connect(self._on_ablesung_edited)
+            value_lbl = QLabel("–")
+            value_lbl.setMinimumWidth(60)
+            value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            del_btn = QPushButton("×")
+            del_btn.setFixedWidth(28)
+            del_btn.setToolTip("Diesen Wert nicht mehr schreiben.")
+            del_btn.clicked.connect(lambda _=False, s=slot, c=combo: self._remove_ablesung_row(s, c))
+            grid.addWidget(combo, i, 0)
+            grid.addWidget(QLabel("→"), i, 1)
+            grid.addWidget(edit, i, 2)
+            grid.addWidget(value_lbl, i, 3)
+            grid.addWidget(del_btn, i, 4)
+            rows.append((combo, edit, value_lbl))
+        self._abl_rows[slot] = rows
 
-    def _label_ablesung_buttons(self, columns: ExcelColumns) -> None:
-        self.t0_btn.setText(f"T0 → {columns.label('Masse_0')} + {columns.label('Zeit_0')}   [F9]")
-        self.t1_btn.setText(f"T1 → {columns.label('Masse_1')} + {columns.label('Zeit_1')}   [F10]")
+    def _row_index(self, slot: str, combo: QComboBox) -> int:
+        return next(i for i, (c, _e, _l) in enumerate(self._abl_rows[slot]) if c is combo)
 
-    def _emit_excel_columns(self) -> None:
-        columns = self.excel_columns()
-        if columns == self._last_excel_columns:
-            return
-        self._last_excel_columns = columns
-        self._label_ablesung_buttons(columns)
-        self.excel_columns_changed.emit(columns)
+    def _on_roi_picked(self, slot: str, combo: QComboBox) -> None:
+        self._abl_config.slots[slot].values[self._row_index(slot, combo)].roi = combo.currentText()
+        self._emit_ablesung_config()
 
-    def _reset_excel_columns(self) -> None:
-        self.set_excel_columns(ExcelColumns(roi=self._preferred_roi))
-        self.excel_columns_changed.emit(self._last_excel_columns)
+    def _add_ablesung_row(self, slot: str) -> None:
+        self._read_ablesung_fields()
+        used = {self.resolve_roi(v.roi) for v in self._abl_config.slots[slot].values}
+        roi = next((n for n in self._roi_names if n not in used), "")
+        self._abl_config.slots[slot].values.append(ValueColumn(roi=roi, column=""))
+        self._rebuild_ablesung_rows(slot)
+        self._abl_rows[slot][-1][1].setFocus()
+        self._emit_ablesung_config()
 
-    def show_excel_target(self, target, error: str = "", columns: Optional[ExcelColumns] = None) -> None:
+    def _remove_ablesung_row(self, slot: str, combo: QComboBox) -> None:
+        self._read_ablesung_fields()
+        del self._abl_config.slots[slot].values[self._row_index(slot, combo)]
+        self._rebuild_ablesung_rows(slot)
+        self._emit_ablesung_config()
+
+    def _read_ablesung_fields(self) -> None:
+        cfg = self._abl_config
+        cfg.sheet = self.excel_sheet_edit.text().strip()
+        for slot, rows in self._abl_rows.items():
+            cfg.slots[slot].time = self.excel_time_edits[slot].text().strip()
+            for vc, (_combo, edit, _lbl) in zip(cfg.slots[slot].values, rows):
+                vc.column = edit.text().strip()
+
+    def _on_ablesung_edited(self) -> None:
+        before = copy.deepcopy(self._abl_config)
+        self._read_ablesung_fields()
+        if self._abl_config != before:
+            self._emit_ablesung_config()
+
+    def _emit_ablesung_config(self) -> None:
+        self._label_ablesung_buttons()
+        self.ablesung_config_changed.emit(self.ablesung_config())
+
+    def _reset_ablesung_config(self) -> None:
+        self.set_ablesung_config(AblesungConfig())
+        self._emit_ablesung_config()
+
+    def _label_ablesung_buttons(self) -> None:
+        for slot, btn in (("T0", self.t0_btn), ("T1", self.t1_btn)):
+            cols = [c for c in self._abl_config.columns(slot) if c]
+            text = ", ".join(cols) if cols else "nichts"
+            if len(text) > 28:
+                text = f"{len(cols)} Spalten"
+            btn.setText(f"{slot} → {text}   [{SLOT_KEYS[slot]}]")
+
+    def update_ablesung_values(self, values: Dict[str, tuple]) -> None:
+        """Shows each row's live value; ``values`` is reading name -> (value, valid)."""
+        for slot, rows in self._abl_rows.items():
+            for vc, (_combo, _edit, lbl) in zip(self._abl_config.slots[slot].values, rows):
+                value, valid = values.get(self.resolve_roi(vc.roi), (None, False))
+                lbl.setText("–" if value is None else f"{value:g}")
+                lbl.setStyleSheet("font-weight: bold;" + ("" if valid else " color: #c62828;"))
+
+    def show_excel_target(self, target, error: str = "", config: Optional[AblesungConfig] = None) -> None:
         """Shows where T0/T1 would write right now (or why they can't)."""
         if error:
             self.excel_target_label.setText(f"<b>Ziel:</b> <span style='color:#c62828'>{html.escape(error)}</span>")
             return
-        columns = columns or self.excel_columns()
+        config = config or self._abl_config
+        time_cols = {_norm_col(sc.time) for sc in config.slots.values() if sc.time.strip()}
 
-        def cell(role):
-            v = target.values.get(role)
+        def cell(col):
+            v = target.values.get(col)
             if v is None or (isinstance(v, str) and not v.strip()):
                 value = "<span style='color:#2e7d32'>leer</span>"
             else:
-                if role in TIME_ROLES and isinstance(v, float) and 0 <= v < 1:
+                if _norm_col(col) in time_cols and isinstance(v, float) and 0 <= v < 1:
                     s = round(v * 86400)
                     v = f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
                 elif isinstance(v, float):
                     v = f"{v:g}"
                 value = f"<b>{html.escape(str(v))}</b>"
-            return f"{html.escape(columns.label(role))} {value}"
+            return f"{html.escape(col)} {value}"
 
         ctx = f" ({html.escape(target.context)})" if target.context else ""
+        parts = [f"{slot}: " + (", ".join(cell(c) for c in config.columns(slot)) or "–") for slot in config.slots]
         self.excel_target_label.setText(
             f"<b>Ziel:</b> {html.escape(target.workbook)} › {html.escape(target.sheet)} › <b>Zeile {target.row}</b>{ctx}<br>"
-            f"T0: {cell('Masse_0')}, {cell('Zeit_0')} &nbsp;|&nbsp; "
-            f"T1: {cell('Masse_1')}, {cell('Zeit_1')}")
-
-    def show_scale_value(self, text: str, ok: bool) -> None:
-        self.scale_value_label.setText(f"{self.scale_roi_combo.currentText() or 'Wert'}: {text}")
-        self.scale_value_label.setStyleSheet(
-            "font-size: 14px; font-weight: bold;" + ("" if ok else " color: #c62828;"))
+            + " &nbsp;|&nbsp; ".join(parts))
 
     def add_ablesung_history(self, text: str) -> None:
         self.ablesung_history.insertItem(0, text)
