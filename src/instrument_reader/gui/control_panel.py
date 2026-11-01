@@ -861,10 +861,11 @@ class ControlPanel(QWidget):
         abl_group = QGroupBox("Ablesung → Labjournal (Excel)")
         abl_layout = QVBoxLayout(abl_group)
         roi_row = QHBoxLayout()
-        roi_row.addWidget(QLabel("Waage-ROI:"))
+        roi_row.addWidget(QLabel("Live-Reading:"))
         self.scale_roi_combo = QComboBox()
+        self.scale_roi_combo.setToolTip("Dieser Messwert wird mit T0/T1 in Excel geschrieben.")
         roi_row.addWidget(self.scale_roi_combo, 1)
-        self.scale_value_label = QLabel("Waage: –")
+        self.scale_value_label = QLabel("Wert: –")
         self.scale_value_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         roi_row.addWidget(self.scale_value_label)
         abl_layout.addLayout(roi_row)
@@ -891,11 +892,15 @@ class ControlPanel(QWidget):
         self.excel_defaults_btn.setToolTip("Setzt Blatt und Spalten auf die Standardwerte zurück.")
         grid.addWidget(self.excel_defaults_btn, 0, 5)
         self.excel_col_edits: Dict[str, QLineEdit] = {}
+        self.excel_value_labels: List[QLabel] = []  # named after the selected live reading
         for r, (slot, key_name, mass_key, time_key) in enumerate(
                 (("T0", "F9", "mass0", "time0"), ("T1", "F10", "mass1", "time1")), start=1):
             grid.addWidget(QLabel(f"{slot} [{key_name}]:"), r, 0)
-            for c, (key, text) in enumerate(((mass_key, "Masse"), (time_key, "Zeit"))):
-                grid.addWidget(QLabel(text), r, 1 + 2 * c)
+            for c, (key, text) in enumerate(((mass_key, "Wert"), (time_key, "Zeit"))):
+                lbl = QLabel(text)
+                if c == 0:
+                    self.excel_value_labels.append(lbl)
+                grid.addWidget(lbl, r, 1 + 2 * c)
                 edit = QLineEdit()
                 edit.setToolTip(col_tip)
                 grid.addWidget(edit, r, 2 + 2 * c, 1, 2 if c else 1)
@@ -906,6 +911,8 @@ class ControlPanel(QWidget):
         for edit in (self.excel_sheet_edit, *self.excel_col_edits.values()):
             edit.editingFinished.connect(self._emit_excel_columns)
         self.excel_defaults_btn.clicked.connect(self._reset_excel_columns)
+        self._preferred_roi = ""
+        self.scale_roi_combo.currentTextChanged.connect(self._on_scale_roi_changed)
 
         t_row = QHBoxLayout()
         self.t0_btn = QPushButton()
@@ -913,7 +920,7 @@ class ControlPanel(QWidget):
         for b in (self.t0_btn, self.t1_btn):
             b.setMinimumHeight(40)
             b.setStyleSheet("font-weight: bold;")
-            b.setToolTip("Schreibt Waagenwert und Uhrzeit in die Zeile, in der in Excel der Cursor steht. "
+            b.setToolTip("Schreibt den Wert des gewählten Live-Readings und die Uhrzeit in die Zeile, in der in Excel der Cursor steht. "
                          "Belegte Zellen werden nie überschrieben.")
             t_row.addWidget(b)
         abl_layout.addLayout(t_row)
@@ -1032,7 +1039,8 @@ class ControlPanel(QWidget):
                 item.setText(new_name)
 
     def set_scale_roi_names(self, names: List[str]) -> None:
-        """Offers the ROIs for the manual reading; keeps the choice, else prefers a 'Waage'."""
+        """Offers the ROIs for the manual reading; keeps the choice, else the saved one, else
+        prefers a 'Waage'."""
         current = [self.scale_roi_combo.itemText(i) for i in range(self.scale_roi_combo.count())]
         if names == current:
             return
@@ -1041,17 +1049,37 @@ class ControlPanel(QWidget):
         self.scale_roi_combo.clear()
         self.scale_roi_combo.addItems(names)
         if selected not in names:
-            selected = next((n for n in names if "waage" in n.lower()), names[0] if names else "")
+            selected = (self._preferred_roi if self._preferred_roi in names else
+                        next((n for n in names if "waage" in n.lower()), names[0] if names else ""))
         self.scale_roi_combo.setCurrentText(selected)
         self.scale_roi_combo.blockSignals(False)
+        self._label_value_fields()
+
+    def _on_scale_roi_changed(self, name: str) -> None:
+        """The user picked another live reading: relabel and keep it for the next start."""
+        self._label_value_fields()
+        if name:
+            self._preferred_roi = name
+            self._emit_excel_columns()
+
+    def _label_value_fields(self) -> None:
+        name = self.scale_roi_combo.currentText() or "Wert"
+        for lbl in self.excel_value_labels:
+            lbl.setText(name)
 
     def excel_columns(self) -> ExcelColumns:
         """What is entered in the Blatt/column fields right now."""
-        return ExcelColumns(sheet=self.excel_sheet_edit.text().strip(),
+        return ExcelColumns(roi=self._preferred_roi, sheet=self.excel_sheet_edit.text().strip(),
                             **{k: e.text().strip() for k, e in self.excel_col_edits.items()})
 
     def set_excel_columns(self, columns: ExcelColumns) -> None:
         """Fills the fields (without emitting a change) and labels the T0/T1 buttons."""
+        self._preferred_roi = columns.roi
+        if columns.roi and self.scale_roi_combo.findText(columns.roi) >= 0:
+            self.scale_roi_combo.blockSignals(True)
+            self.scale_roi_combo.setCurrentText(columns.roi)
+            self.scale_roi_combo.blockSignals(False)
+            self._label_value_fields()
         self.excel_sheet_edit.setText(columns.sheet)
         for key, edit in self.excel_col_edits.items():
             edit.setText(getattr(columns, key))
@@ -1071,7 +1099,7 @@ class ControlPanel(QWidget):
         self.excel_columns_changed.emit(columns)
 
     def _reset_excel_columns(self) -> None:
-        self.set_excel_columns(ExcelColumns())
+        self.set_excel_columns(ExcelColumns(roi=self._preferred_roi))
         self.excel_columns_changed.emit(self._last_excel_columns)
 
     def show_excel_target(self, target, error: str = "", columns: Optional[ExcelColumns] = None) -> None:
@@ -1101,7 +1129,7 @@ class ControlPanel(QWidget):
             f"T1: {cell('Masse_1')}, {cell('Zeit_1')}")
 
     def show_scale_value(self, text: str, ok: bool) -> None:
-        self.scale_value_label.setText(f"Waage: {text}")
+        self.scale_value_label.setText(f"{self.scale_roi_combo.currentText() or 'Wert'}: {text}")
         self.scale_value_label.setStyleSheet(
             "font-size: 14px; font-weight: bold;" + ("" if ok else " color: #c62828;"))
 

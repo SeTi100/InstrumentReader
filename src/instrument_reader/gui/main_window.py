@@ -704,7 +704,7 @@ class MainWindow(QMainWindow):
         mass_h, time_h = (columns.label(r) for r in SLOTS[slot])
         target, ok = None, False
         if not valid:
-            result = (f"kein gültiger Waagenwert ({roi or 'kein Waagen-ROI'}) – nichts geschrieben, "
+            result = (f"kein gültiger Wert ({roi or 'kein Live-Reading gewählt'}) – nichts geschrieben, "
                       f"Zeit war {when:%H:%M:%S}")
         else:
             try:

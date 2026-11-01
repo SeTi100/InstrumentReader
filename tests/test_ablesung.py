@@ -320,3 +320,28 @@ def test_fields_are_saved_and_label_buttons(qtbot):
     assert w2.control_panel.excel_col_edits["mass0"].text() == "B"
     w2.control_panel.excel_defaults_btn.click()
     assert w2.excel_link.columns == ExcelColumns()
+
+
+def test_value_fields_follow_the_selected_live_reading(qtbot):
+    from instrument_reader.core import data_safety
+    from instrument_reader.gui.main_window import MainWindow
+
+    w = MainWindow()
+    qtbot.addWidget(w)
+    cp = w.control_panel
+    cp.set_scale_roi_names(["Temperatur", "Waage"])
+    assert cp.scale_roi_combo.currentText() == "Waage"
+    assert [lbl.text() for lbl in cp.excel_value_labels] == ["Waage", "Waage"]
+
+    cp.scale_roi_combo.setCurrentText("Temperatur")  # user picks another reading
+    assert [lbl.text() for lbl in cp.excel_value_labels] == ["Temperatur", "Temperatur"]
+    cp.show_scale_value("251", True)
+    assert cp.scale_value_label.text() == "Temperatur: 251"
+    assert load_columns(data_safety.data_dir() / "settings.json").roi == "Temperatur"
+
+    w2 = MainWindow()  # next start: the saved reading wins over the 'Waage' default
+    qtbot.addWidget(w2)
+    w2.control_panel.set_scale_roi_names(["Waage", "Temperatur"])
+    assert w2.control_panel.scale_roi_combo.currentText() == "Temperatur"
+    w2.control_panel.excel_defaults_btn.click()  # Standard resets columns, keeps the reading
+    assert w2.excel_link.columns == ExcelColumns(roi="Temperatur")

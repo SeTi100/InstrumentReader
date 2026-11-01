@@ -56,7 +56,9 @@ def column_index(spec: str) -> Optional[int]:
 @dataclass
 class ExcelColumns:
     """Where T0/T1 write: an optional sheet name (empty = the active sheet) and, per role,
-    a header name or a column letter."""
+    a header name or a column letter. ``roi`` is the live reading whose value is written
+    (empty = pick one automatically)."""
+    roi: str = ""
     sheet: str = ""
     mass0: str = "Masse_0"
     time0: str = "Zeit_0"
