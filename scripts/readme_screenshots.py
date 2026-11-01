@@ -14,7 +14,6 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["INSTRUMENT_READER_DATA_DIR"] = tempfile.mkdtemp(prefix="ir-screens-")
@@ -26,6 +25,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QSplitter
 
 from instrument_reader.core.calculation import CalculationChannel
+from instrument_reader.core.excel_link import AblesungConfig, SlotConfig, Target, ValueColumn
 from instrument_reader.core.preprocessing import PreprocessingConfig
 from instrument_reader.core.roi import DisplayType, ROIConfig, ROIShape
 
@@ -208,6 +208,14 @@ def main():
         conn.execute("UPDATE experiments SET created_at = ? WHERE id = ?", (_iso(t_start - 60), exp_id))
     win.set_active_run(db.current_run_id, exp_id, "Verdampfung Ethanol")
 
+    # Excel-Ziel: T0 schreibt Waage und Temperatur, T1 nur die Waage, beide mit Uhrzeit
+    abl = AblesungConfig(slots={
+        "T0": SlotConfig([ValueColumn("Waage", "Masse_0"), ValueColumn("Temperatur", "T_0")], "Zeit_0"),
+        "T1": SlotConfig([ValueColumn("Waage", "Masse_1")], "Zeit_1"),
+    })
+    win.control_panel.set_ablesung_config(abl)
+    win.excel_link.config = abl
+
     # Live-Werte einspeisen, damit Rechenkanal und Stufenerkennung echte Werte zeigen
     now = time.time()
     mass = flow = temp = 0.0
@@ -219,20 +227,27 @@ def main():
 
     # So sieht das Ablesung-Panel aus, wenn Excel mit dem Labjournal offen ist
     clock = lambda h, m, s: (h * 3600 + m * 60 + s) / 86400
-    win.control_panel.show_excel_target(SimpleNamespace(
-        workbook="Labjournal_2026.xlsx", sheet="Verdampfung", row=14, context="Stufe 3",
-        values={"Masse_0": 84.512, "Zeit_0": clock(17, 41, 5), "Masse_1": None, "Zeit_1": None}))
-    for text in ("✓ T0 17:41:05  Zeile 14: Masse_0 = 84.512, Zeit_0 = 17:41:05",
-                 "✓ T1 17:12:48  Zeile 13: Masse_1 = 86.630, Zeit_1 = 17:12:48"):
+    win.control_panel.show_excel_target(Target(
+        workbook="Labjournal_2026.xlsx", sheet="Verdampfung", row=14, cols={},
+        values={"Masse_0": 84.512, "T_0": 35.0, "Zeit_0": clock(17, 41, 5), "Masse_1": None, "Zeit_1": None},
+        context_values={"Temperatur": 35, "V_MFC": 0.67}), config=abl)
+    for text in ("✓ T0 17:41:05  Zeile 14: Masse_0 = 84.512, T_0 = 35, Zeit_0 = 17:41:05",
+                 "✓ T1 17:12:48  Zeile 13: Masse_1 = 86.63, Zeit_1 = 17:12:48"):
         win.control_panel.add_ablesung_history(text)
+    win.control_panel.set_ablesung_status(
+        "✓ T0 17:41:05  Zeile 14: Masse_0 = 84.512, T_0 = 35, Zeit_0 = 17:41:05")
 
     def shoot():
         save(win, "hauptfenster.png")
-        # Rechte Seite nach unten gescrollt: Live-Werte und Rechenkanäle
+        save(win.control_panel.excel_target_label.parentWidget(), "ablesung.png")
+        # Rechte Seite ab den Live-Werten: Live-Werte, Rechenkanäle und ROI-Liste
+        from PySide6.QtCore import QPoint, QRect
         from PySide6.QtWidgets import QScrollArea
-        scroll = win.control_panel.findChild(QScrollArea)
-        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
-        save(win.control_panel, "messwerte.png")
+        content = win.control_panel.findChild(QScrollArea).widget()
+        top = win.control_panel.readings_table.mapTo(content, QPoint(0, 0)).y() - 30
+        QApplication.processEvents()
+        content.grab(QRect(0, top, content.width(), content.height() - top)).save(str(OUT / "messwerte.png"))
+        print("geschrieben:", OUT / "messwerte.png")
 
         dash = RunsDashboardDialog(win.db_writer.db, current_run_id=db.current_run_id, parent=win)
         dash.resize(1500, 560)
