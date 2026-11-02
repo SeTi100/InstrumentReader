@@ -497,3 +497,70 @@ def test_live_camera_uses_helper_process():
 
     assert OpenCVCamera(0).uses_helper_process is OpenCVCamera.USE_HELPER_PROCESS
     assert OpenCVCamera("run.mp4").uses_helper_process is False
+
+class FrameServerCamera(StuckRouteCamera):
+    """Works on the direct route until the Windows camera service crashes."""
+
+    service_down = False
+
+    def open(self):
+        StuckRouteCamera.routes_tried.append(self.route)
+        if self.route == "direct" and FrameServerCamera.service_down:
+            return False
+        return FakeCamera.open(self)
+
+    def read(self):
+        if self.route == "direct" and FrameServerCamera.service_down:
+            return False, None
+        return super().read()
+
+    def clone(self):
+        twin = FrameServerCamera(self.device, self.source)
+        twin.route = self.route
+        return twin
+
+
+def test_dropout_on_direct_route_tries_other_route_first(qtbot, fast_thread):
+    StuckRouteCamera.routes_tried = []
+    FrameServerCamera.service_down = False
+    device = FakeDevice()
+    thread = CameraThread(FrameServerCamera(device))
+    states = []
+    thread.status_changed.connect(lambda st, msg: states.append(st))
+    thread.start()
+    qtbot.waitUntil(lambda: bool(states) and states[-1] == "connected", timeout=3000)
+    assert StuckRouteCamera.routes_tried == ["direct"]
+
+    FrameServerCamera.service_down = True
+    qtbot.waitUntil(lambda: "reconnecting" in states and states[-1] == "connected", timeout=3000)
+    # No more attempts on the dead route: straight to the other backend, and it stays there.
+    assert StuckRouteCamera.routes_tried == ["direct", "other"]
+    assert thread.camera.route == "other"
+    thread.stop()
+    FrameServerCamera.service_down = False
+    assert device.open_handles == 0
+
+
+def test_camera_log_records_dropouts(qtbot, fast_thread, tmp_path):
+    import logging
+
+    from instrument_reader.app import setup_camera_log
+
+    setup_camera_log(tmp_path)
+    log = logging.getLogger("instrument_reader.camera")
+    try:
+        device = FakeDevice()
+        thread, _frames, states = _start(device, qtbot)
+        device.connected = False
+        qtbot.waitUntil(lambda: states[-1] == "reconnecting", timeout=2000)
+        device.connected = True
+        qtbot.waitUntil(lambda: states[-1] == "connected", timeout=3000)
+        thread.stop()
+    finally:
+        for handler in list(log.handlers):
+            handler.close()
+            log.removeHandler(handler)
+    text = (tmp_path / "kamera.log").read_text(encoding="utf-8")
+    assert "Verbindung abgebrochen" in text
+    assert "reconnecting: Verbindung unterbrochen" in text
+    assert text.count("connected: Kamera verbunden") == 2

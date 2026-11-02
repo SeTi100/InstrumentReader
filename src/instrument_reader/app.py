@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 import os
 import sys
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -60,10 +61,24 @@ def prepare_data(parent=None) -> bool:
     return True
 
 
+def setup_camera_log(folder) -> None:
+    """Writes camera connects, dropouts and route switches to <data>/kamera.log."""
+    handler = logging.handlers.RotatingFileHandler(
+        os.path.join(folder, "kamera.log"), maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log = logging.getLogger("instrument_reader.camera")
+    log.setLevel(logging.INFO)
+    log.addHandler(handler)
+
+
 def main():
     app = QApplication(sys.argv)
     if not prepare_data():
         sys.exit(1)
+    try:
+        setup_camera_log(data_safety.data_dir())
+    except OSError:
+        logging.getLogger(__name__).exception("Kamera-Log kann nicht angelegt werden")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

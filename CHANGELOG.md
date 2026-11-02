@@ -3,6 +3,17 @@
 Alle nennenswerten Änderungen an InstrumentReader. Neueste Einträge oben.
 Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
+## 2026-11-02
+
+### Kamera: schneller wieder verbunden, Ausfälle im Log
+- Hintergrund: Abbrüche kamen vom Windows-Kameradienst „FrameServer“, der im AMD-MJPEG-Decoder
+  abstürzt und danach gestoppt bleibt. Bisher versuchte die App dann dreimal den normalen Weg
+  (Media Foundation, bis zu 20 s pro Versuch), bevor sie auf DirectShow wechselte: ca. 90 s ohne Bild.
+- **Bricht das Bild auf dem normalen Weg ab, wird sofort der Ersatzweg (DirectShow) probiert.** Die App
+  bleibt dann auf dem Weg, der funktioniert, auch nach Stopp/Start der Kamera.
+- **Kamera-Log** `kamera.log` im Datenordner: Start, Verbunden, Abbruch, Weg-Wechsel und Fehler des
+  Kamera-Hilfsprozesses, jeweils mit Uhrzeit (max. 4 × 1 MB).
+
 ## 2026-10-17
 
 ### Ablesung → Labjournal (Excel)

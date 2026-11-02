@@ -9,9 +9,12 @@ device when the driver hangs inside a read.
 
 ProcessCapture has the parts of cv2.VideoCapture's interface that OpenCVCamera uses.
 """
+import logging
 import multiprocessing as mp
 
 import numpy as np
+
+log = logging.getLogger("instrument_reader.camera")
 
 # The helper starts Python, imports OpenCV and starts the device.
 START_TIMEOUT_S = 15.0
@@ -96,6 +99,9 @@ class ProcessCapture:
             self._fps, self._backend, self.device_name = payload
             self._opened = True
         else:
+            log.warning("Hilfsprozess: Kamera %s (Backend %s%s) %s", source, api,
+                        ", anderer Weg" if other_backend else "",
+                        "meldet sich nicht" if kind is None else "lässt sich nicht öffnen")
             self.release()
 
     def _recv(self, timeout: float):
