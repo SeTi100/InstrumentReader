@@ -1,7 +1,11 @@
+import logging
 import threading
 import time
 
 from PySide6.QtCore import QThread, Signal, QMutex
+
+# Written to <data>/kamera.log (see app.setup_camera_log), so dropouts can be traced later.
+log = logging.getLogger("instrument_reader.camera")
 
 
 class _LiveSession:
@@ -80,6 +84,8 @@ class CameraThread(QThread):
     RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
     # Failed attempts before the camera is tried through the other Windows backend.
     ROUTE_SWITCH_AFTER = 3
+    # Route the camera uses unless told otherwise (OpenCVCamera's ROUTE_DIRECT).
+    DIRECT_ROUTE = "direct"
     STOP_JOIN_TIMEOUT_S = 1.0
     # Max. rate of GUI frame updates while a video runs unpaced
     DISPLAY_INTERVAL_S = 1.0 / 30.0
@@ -198,6 +204,7 @@ class CameraThread(QThread):
         if state != self.state or message != self._status_message:
             self.state = state
             self._status_message = message
+            log.info("%s: %s", state, message or "-")
             self.status_changed.emit(state, message)
 
     def _sleep(self, seconds: float):
@@ -210,6 +217,8 @@ class CameraThread(QThread):
         session: _LiveSession | None = None
         attempt = 0
         ever_connected = False
+        log.info("Start: Quelle %s, Name %s, Weg %s", getattr(self.camera, "source", "?"),
+                 getattr(self.camera, "name", None), getattr(self.camera, "route", "-"))
         self._set_state("connecting", "Verbinde mit Kamera …")
         try:
             while self.running:
@@ -238,7 +247,7 @@ class CameraThread(QThread):
                     if not self.running:
                         break
                     if attempt and attempt % self.ROUTE_SWITCH_AFTER == 0 and hasattr(self.camera, "next_route"):
-                        self.camera.next_route()
+                        log.info("%d Fehlversuche, wechsle auf Weg %s", attempt, self.camera.next_route())
                     attempt += 1
                     session = _LiveSession(self.camera.clone(), self._emit_frame)
                     session.start()
@@ -263,8 +272,19 @@ class CameraThread(QThread):
                 if session.done or stalled:
                     # Stop the old session (it releases its handle as soon as the driver
                     # lets go) and immediately start over with a fresh connection.
+                    was_live = session.last_frame_at is not None
+                    log.warning("Verbindung %s (%s, Versuch %d)",
+                                "abgebrochen" if was_live else "nicht zustande gekommen",
+                                "Sitzung beendet" if session.done else "keine Bilder mehr", attempt)
                     session.stop()
                     session = None
+                    if (was_live and getattr(self.camera, "route", None) == self.DIRECT_ROUTE
+                            and hasattr(self.camera, "next_route")):
+                        # A live picture that dies on the usual route usually means the Windows
+                        # camera service (Frame Server) crashed; it then stays down and every
+                        # attempt on that route hangs until its timeout. The other backend does
+                        # not depend on it, so try that first.
+                        log.info("Abbruch auf dem normalen Weg, versuche sofort Weg %s", self.camera.next_route())
                     if ever_connected:
                         self._set_state("reconnecting", f"Verbindung unterbrochen – verbinde neu (Versuch {attempt + 1}) …")
                     else:

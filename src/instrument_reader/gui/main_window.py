@@ -63,6 +63,9 @@ class MainWindow(QMainWindow):
         # Name of the live camera in use, so a reconnect finds it again even if the
         # OS renumbers devices (and never silently switches to another camera).
         self._camera_name = None
+        # Route (backend) each camera last worked on, so Stop/Start does not go back to a
+        # route that just failed (e.g. Media Foundation after the camera service crashed).
+        self._camera_routes = {}
         self._device_watch = QTimer(self)
         self._device_watch.setInterval(500)
         self._device_watch.timeout.connect(self.control_panel.refresh_cameras)
@@ -128,6 +131,7 @@ class MainWindow(QMainWindow):
                 labels += [combo.itemText(i) for i in range(combo.count()) if parse_source(combo.itemText(i)) == src]
                 self._camera_name = next((n for n in map(label_name, labels) if n), None)
                 self.camera.name = self._camera_name
+                self.camera.route = self._camera_routes.get(self._camera_name, self.camera.route)
                 self._device_watch.start()
             self.camera_thread.start()
             self.ocr_worker.start()
@@ -246,6 +250,9 @@ class MainWindow(QMainWindow):
 
     def on_camera_status(self, state: str, message: str):
         self.control_panel.set_camera_status(state, message)
+        route = getattr(self.camera, "route", None)
+        if state == "connected" and self._camera_name and route:
+            self._camera_routes[self._camera_name] = route
         if state in ("connecting", "reconnecting"):
             # Without a live picture the OCR must not keep logging the last frame as current.
             self.ocr_worker.update_frame(None)
