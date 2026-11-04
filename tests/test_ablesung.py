@@ -196,7 +196,8 @@ class FakeRange:
 
     @property
     def Value(self):
-        return (tuple(self.sheet.data.get((self.a.Row, c)) for c in range(self.a.Column, self.b.Column + 1)),)
+        return tuple(tuple(self.sheet.data.get((r, c)) for c in range(self.a.Column, self.b.Column + 1))
+                     for r in range(self.a.Row, self.b.Row + 1))
 
 
 class FakeUsed:
@@ -356,3 +357,39 @@ def test_panel_rows_are_editable_and_saved(qtbot):
     assert w2.excel_link.config.slots["T0"].values == [ValueColumn("Temperatur", "Temp_0")]
     w2.control_panel.excel_defaults_btn.click()
     assert w2.excel_link.config == AblesungConfig()
+
+
+# -- polling Excel never blocks the GUI thread ---------------------------------------------------
+
+
+def test_excel_poller_runs_in_background_and_reports_changes(qtbot):
+    import threading
+    import time
+
+    from instrument_reader.gui.excel_poller import ExcelPoller
+
+    gui_thread = threading.get_ident()
+    calls = []
+
+    class SlowLink:
+        answer = "Excel ist nicht geöffnet"
+
+        def target(self):
+            calls.append(threading.get_ident())
+            time.sleep(0.05)  # a slow Excel must not stall the caller
+            raise ExcelError(self.answer)
+
+    link = SlowLink()
+    poller = ExcelPoller(lambda: link, 20)
+    seen = []
+    poller.target_changed.connect(lambda t, e: seen.append(e))
+    poller.start()
+    try:
+        qtbot.waitUntil(lambda: len(calls) >= 3, timeout=3000)
+        assert seen == ["Excel ist nicht geöffnet"]  # unchanged answers are not re-sent
+        link.answer = "In Excel ist keine Arbeitsmappe offen"
+        qtbot.waitUntil(lambda: len(seen) == 2, timeout=3000)
+        assert gui_thread not in calls
+    finally:
+        poller.stop()
+    assert not poller.is_active()

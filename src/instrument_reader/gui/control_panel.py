@@ -1184,8 +1184,13 @@ class ControlPanel(QWidget):
         for slot, rows in self._abl_rows.items():
             for vc, (_combo, _edit, lbl) in zip(self._abl_config.slots[slot].values, rows):
                 value, valid = values.get(self.resolve_roi(vc.roi), (None, False))
-                lbl.setText("–" if value is None else f"{value:g}")
-                lbl.setStyleSheet("font-weight: bold;" + ("" if valid else " color: #c62828;"))
+                text = "–" if value is None else f"{value:g}"
+                style = "font-weight: bold;" + ("" if valid else " color: #c62828;")
+                # Only touch what changed: setStyleSheet re-polishes and re-lays out the panel
+                if lbl.text() != text:
+                    lbl.setText(text)
+                if lbl.styleSheet() != style:
+                    lbl.setStyleSheet(style)
 
     def show_excel_target(self, target, error: str = "", config: Optional[AblesungConfig] = None) -> None:
         """Shows where T0/T1 would write right now (or why they can't)."""

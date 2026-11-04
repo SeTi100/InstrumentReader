@@ -311,9 +311,14 @@ class ExcelLink:
         cols, ctx, _ = self._resolve([], first_col)
         best = (0, cols, ctx)
         found = letters_only
-        for r in range(used.Row, last_row + 1):
-            vals = ws.Range(ws.Cells(r, first_col), ws.Cells(r, first_col + used.Columns.Count - 1)).Value
-            cols, ctx, is_header = self._resolve(list(vals[0]) if isinstance(vals, tuple) else [vals], first_col)
+        # One COM call for all candidate rows: every call is a round trip to the Excel process.
+        rows = ()
+        if last_row >= used.Row:
+            rows = ws.Range(ws.Cells(used.Row, first_col),
+                            ws.Cells(last_row, first_col + used.Columns.Count - 1)).Value
+            rows = rows if isinstance(rows, tuple) else ((rows,),)
+        for r, vals in enumerate(rows, start=used.Row):
+            cols, ctx, is_header = self._resolve(list(vals) if isinstance(vals, tuple) else [vals], first_col)
             if is_header:
                 best, found = (r, cols, ctx), True  # the last header row above the cursor wins
             elif not found and len(cols) > len(best[1]):

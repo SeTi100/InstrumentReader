@@ -13,6 +13,7 @@ from instrument_reader.core import data_safety
 from instrument_reader.core.ablesung import AblesungLog
 from instrument_reader.core.excel_link import ExcelError, ExcelLink, load_config, save_config
 from instrument_reader.gui import global_hotkeys
+from instrument_reader.gui.excel_poller import ExcelPoller
 from instrument_reader.core.camera import OpenCVCamera
 from instrument_reader.core.recorder import VideoRecorder
 from instrument_reader.core.roi import ROIShape, ROIConfig, DisplayType
@@ -197,9 +198,9 @@ class MainWindow(QMainWindow):
         self._unflash_timer = QTimer(self)
         self._unflash_timer.setInterval(1500)
         self._unflash_timer.timeout.connect(self._unflash)
-        self._excel_poll = QTimer(self)
-        self._excel_poll.setInterval(EXCEL_POLL_MS)
-        self._excel_poll.timeout.connect(self.refresh_excel_target)
+        # Excel is asked in a background thread: COM calls in the GUI thread froze the window
+        self._excel_poll = ExcelPoller(lambda: self.excel_link, EXCEL_POLL_MS, self)
+        self._excel_poll.target_changed.connect(self._show_excel_target)
         if os.environ.get("INSTRUMENT_READER_EXCEL", "1") != "0":
             self._excel_poll.start()
         self._setup_ablesung_hotkeys()
@@ -691,14 +692,17 @@ class MainWindow(QMainWindow):
             save_config(self._settings_file(), config)
         except OSError as e:
             self.statusBar().showMessage(f"Excel-Ziel nicht gespeichert: {e}", 10000)
-        if self._excel_poll.isActive():
-            self.refresh_excel_target()
+        self.refresh_excel_target()
 
     def refresh_excel_target(self):
-        try:
-            self.control_panel.show_excel_target(self.excel_link.target(), config=self.excel_link.config)
-        except ExcelError as e:
-            self.control_panel.show_excel_target(None, str(e))
+        """Has the background poller ask Excel again right away (never blocks)."""
+        self._excel_poll.refresh_now()
+
+    def _show_excel_target(self, target, error: str):
+        if target is None:
+            self.control_panel.show_excel_target(None, error)
+        else:
+            self.control_panel.show_excel_target(target, config=self.excel_link.config)
 
     def take_ablesung(self, slot: str):
         """T0/T1: writes the configured live readings as shown right now and the time of the
