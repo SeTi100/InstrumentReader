@@ -130,6 +130,29 @@ class OpenCVCamera(CameraSource):
     def uses_helper_process(self) -> bool:
         return self.USE_HELPER_PROCESS and isinstance(self._source, int)
 
+    @property
+    def via_frame_server(self) -> bool:
+        """True if the current route reads through Media Foundation, i.e. through the
+        Windows camera service (Frame Server) that crashes in the AMD drivers on the lab PC.
+        DirectShow does not depend on it (it kept delivering when the service was down)."""
+        if not (isinstance(self._source, int) and sys.platform.startswith("win")):
+            return False
+        direct_is_msmf = self._backend()[1] in (None, cv2.CAP_MSMF)
+        return direct_is_msmf if self.route == ROUTE_DIRECT else not direct_is_msmf
+
+    def avoid_frame_server(self) -> None:
+        """Uses the DirectShow route if the current one goes through Media Foundation."""
+        if self.via_frame_server:
+            self.next_route()
+
+    def stuck_helpers(self) -> int:
+        """Helper processes that could not be ended (stuck in the driver) and still hold a device."""
+        if not self.uses_helper_process:
+            return 0
+        from instrument_reader.core.camera_process import unfinished_helpers
+
+        return unfinished_helpers()
+
     def _backend(self) -> tuple[int | str, int | None]:
         """(device index, backend) the direct route opens."""
         if isinstance(self._source, int) and not _is_plain_index(self._source):

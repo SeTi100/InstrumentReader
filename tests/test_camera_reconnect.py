@@ -14,6 +14,7 @@ class FakeDevice:
     def __init__(self):
         self.connected = True
         self.hang = False
+        self.hang_once = False  # only the next read gets stuck
         self.unhang = threading.Event()
         self.open_handles = 0
         self.opens = 0
@@ -44,6 +45,8 @@ class FakeCamera:
 
     def read(self):
         if self.device.hang:
+            if self.device.hang_once:
+                self.device.hang = False
             self.device.unhang.wait(5)
             return False, None
         if not self.device.connected:
@@ -105,12 +108,12 @@ def test_recovers_from_read_that_hangs_in_driver(qtbot, fast_thread):
     device = FakeDevice()
     thread, frames, states = _start(device, qtbot)
 
-    device.hang = True
+    opens = device.opens
+    device.hang_once = device.hang = True
     qtbot.waitUntil(lambda: states[-1] == "reconnecting", timeout=2000)
     # A new connection is opened while the old read is still stuck.
-    opens = device.opens
-    device.hang = False
     qtbot.waitUntil(lambda: device.opens > opens and states[-1] == "connected", timeout=3000)
+    assert not device.unhang.is_set()
 
     device.unhang.set()  # the stuck read finally returns; its handle gets released
     thread.stop()

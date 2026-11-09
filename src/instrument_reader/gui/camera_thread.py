@@ -80,8 +80,12 @@ class CameraThread(QThread):
     OPEN_TIMEOUT_S = 8.0
     # A camera helper process first has to start Python and import OpenCV.
     HELPER_OPEN_TIMEOUT_S = 20.0
-    # Delay before each reconnect attempt; the last value repeats.
-    RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
+    # Delay before each reconnect attempt; the last value repeats. Quick at first for
+    # short glitches, then backing off so a hung camera stack is not hammered.
+    RECONNECT_DELAYS_S = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+    # Abandoned connection attempts still stuck in the driver (plus helper processes that
+    # could not be killed) at which no new attempt is started until one of them ends.
+    MAX_HANGING_CONNECTIONS = 2
     # Failed attempts before the camera is tried through the other Windows backend.
     ROUTE_SWITCH_AFTER = 3
     # Route the camera uses unless told otherwise (OpenCVCamera's ROUTE_DIRECT).
@@ -209,12 +213,25 @@ class CameraThread(QThread):
 
     def _sleep(self, seconds: float):
         deadline = time.monotonic() + seconds
-        while self.running and time.monotonic() < deadline:
+        while self.running and not self._retarget and time.monotonic() < deadline:
             self.msleep(10)
+
+    def _via_frame_server(self) -> bool:
+        if hasattr(self.camera, "via_frame_server"):
+            return self.camera.via_frame_server
+        return getattr(self.camera, "route", None) == self.DIRECT_ROUTE
+
+    def _hanging_connections(self, abandoned: list) -> int:
+        abandoned[:] = [s for s in abandoned if not s.done]
+        stuck = getattr(self.camera, "stuck_helpers", None)
+        return len(abandoned) + (stuck() if stuck else 0)
 
     def _run_live(self):
         """Keeps a live camera connected until stop(), reconnecting as fast as the device allows."""
         session: _LiveSession | None = None
+        # Sessions given up on whose thread has not ended yet (read or open stuck in the driver).
+        abandoned: list[_LiveSession] = []
+        waiting_for_hung = False
         attempt = 0
         ever_connected = False
         log.info("Start: Quelle %s, Name %s, Weg %s", getattr(self.camera, "source", "?"),
@@ -225,6 +242,7 @@ class CameraThread(QThread):
                 if not self._device_available:
                     if session is not None:
                         session.stop()
+                        abandoned.append(session)
                         session = None
                     attempt = 0
                     self._set_state(
@@ -238,10 +256,23 @@ class CameraThread(QThread):
                     self._retarget = False
                     if session is not None:
                         session.stop()
+                        abandoned.append(session)
                         session = None
                         attempt = 0
 
                 if session is None:
+                    hanging = self._hanging_connections(abandoned)
+                    if hanging >= self.MAX_HANGING_CONNECTIONS:
+                        # Every further attempt would only add another process stuck in the
+                        # driver (on 09.11. the whole system hung). Wait for one to end.
+                        if not waiting_for_hung:
+                            log.warning("%d Verbindungsversuche hängen im Kameratreiber, starte keinen weiteren", hanging)
+                            waiting_for_hung = True
+                        self._set_state("reconnecting" if ever_connected else "connecting",
+                                        "Kameratreiber hängt – warte, bis alte Verbindungsversuche enden …")
+                        self.msleep(100)
+                        continue
+                    waiting_for_hung = False
                     delay = self.RECONNECT_DELAYS_S[min(attempt, len(self.RECONNECT_DELAYS_S) - 1)]
                     self._sleep(delay)
                     if not self.running:
@@ -277,14 +308,15 @@ class CameraThread(QThread):
                                 "abgebrochen" if was_live else "nicht zustande gekommen",
                                 "Sitzung beendet" if session.done else "keine Bilder mehr", attempt)
                     session.stop()
+                    abandoned.append(session)
                     session = None
-                    if (was_live and getattr(self.camera, "route", None) == self.DIRECT_ROUTE
-                            and hasattr(self.camera, "next_route")):
-                        # A live picture that dies on the usual route usually means the Windows
+                    if was_live and self._via_frame_server() and hasattr(self.camera, "next_route"):
+                        # A live picture that dies on Media Foundation usually means the Windows
                         # camera service (Frame Server) crashed; it then stays down and every
-                        # attempt on that route hangs until its timeout. The other backend does
-                        # not depend on it, so try that first.
-                        log.info("Abbruch auf dem normalen Weg, versuche sofort Weg %s", self.camera.next_route())
+                        # attempt on that route hangs until its timeout. DirectShow does not
+                        # depend on it, so try that first. (A camera already on DirectShow, also
+                        # a typed 701, stays there.)
+                        log.info("Abbruch über Media Foundation, versuche sofort Weg %s", self.camera.next_route())
                     if ever_connected:
                         self._set_state("reconnecting", f"Verbindung unterbrochen – verbinde neu (Versuch {attempt + 1}) …")
                     else:

@@ -112,13 +112,14 @@ class Database:
             conn.executescript(self.RUN_EVENTS_SCHEMA)
             self.upgrade_rows(conn)
 
-    # Start, stop, resume and abort of each run, so gaps in a resumed run stay visible.
+    # Start, stop, resume and abort of each run, so gaps in a resumed run stay visible;
+    # camera_lost / camera_back mark stretches without a camera picture (no readings).
     RUN_EVENTS_SCHEMA = """
     CREATE TABLE IF NOT EXISTS run_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         run_id INTEGER NOT NULL,
         time TIMESTAMP NOT NULL,
-        event TEXT NOT NULL,          -- start | stop | resume | abort
+        event TEXT NOT NULL,          -- start | stop | resume | abort | camera_lost | camera_back
         reason TEXT,
         FOREIGN KEY (run_id) REFERENCES runs(id)
     );
