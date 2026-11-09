@@ -1,5 +1,6 @@
 import copy
 import html
+import sys
 import uuid
 from typing import Dict, List, Optional, Any
 
@@ -709,6 +710,16 @@ class ControlPanel(QWidget):
         self.camera_status.setWordWrap(True)
         self.camera_status.setVisible(False)
         cam_layout.addWidget(self.camera_status)
+
+        # The Windows camera service (Media Foundation) crashes in the AMD drivers on the lab
+        # PC; DirectShow does not use it. Applies from the next Start.
+        self.directshow_cb = QCheckBox("Über DirectShow öffnen (ohne Windows-Kameradienst)")
+        self.directshow_cb.setToolTip(
+            "Liest die Kamera über DirectShow statt Media Foundation. Der Windows-Kameradienst "
+            "(FrameServer) stürzt hier regelmäßig im AMD-Treiber ab; DirectShow läuft dann weiter.\n"
+            "Gilt ab dem nächsten Start der Kamera.")
+        self.directshow_cb.setVisible(sys.platform.startswith("win"))
+        cam_layout.addWidget(self.directshow_cb)
 
         self.camera_hint = QLabel(
             "DirectShow-Kameras (z. B. virtuelle Kameras) können nicht aufgelistet werden: "

@@ -21,6 +21,16 @@ START_TIMEOUT_S = 15.0
 READ_TIMEOUT_S = 2.0
 MAX_READ_FAILURES = 3
 
+# Helpers that were still alive after kill(): stuck in the kernel inside the camera driver.
+# Each still holds the device, so the camera thread starts no new connection while they last.
+_unfinished: list = []
+
+
+def unfinished_helpers() -> int:
+    """Number of helper processes that could not be ended and are still alive."""
+    _unfinished[:] = [p for p in _unfinished if p.is_alive()]
+    return len(_unfinished)
+
 
 def _capture_loop(source, api, name, other_backend, conn, stop):
     try:
@@ -151,3 +161,8 @@ class ProcessCapture:
             if self._proc.is_alive():
                 self._proc.kill()
                 self._proc.join(1.0)
+                if self._proc.is_alive():
+                    log.error("Hilfsprozess %s lässt sich nicht beenden (hängt im Kameratreiber)", self._proc.pid)
+                    _unfinished.append(self._proc)
+                else:
+                    log.info("Hängender Hilfsprozess %s beendet", self._proc.pid)

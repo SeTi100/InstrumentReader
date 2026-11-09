@@ -143,6 +143,15 @@ class DatabaseWriter(QObject):
             self.current_run_id = None
             self.run_ended.emit(run_id)
 
+    def add_run_event(self, event: str, time: str, reason: str = "") -> None:
+        """Notes something that happened during the current run (e.g. camera_lost / camera_back)."""
+        if not self.current_run_id:
+            return
+        with sqlite3.connect(self.db.db_path) as conn:
+            conn.execute("INSERT INTO run_events (run_id, time, event, reason) VALUES (?, ?, ?, ?)",
+                         (self.current_run_id, time, event, reason or None))
+        self.db._log("run_event", id=self.current_run_id, time=time, kind=event, reason=reason or None)
+
     def set_active_run(self, run_id: int):
         """Makes run_id the run readings are logged into. The current run is ended first;
         a run that had ended is resumed (the gap stays visible in run_events)."""

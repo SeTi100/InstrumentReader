@@ -3,6 +3,25 @@
 Alle nennenswerten Änderungen an InstrumentReader. Neueste Einträge oben.
 Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
+## 2026-11-09
+
+### Kamera-Ausfall: Alarm statt stiller Lücke
+- Hintergrund: Am 09.11. hing der Kamera-/Grafik-Stack (Netzteil eingesteckt), 16 Minuten kam kein
+  Bild, und niemand hat es gemerkt. Die App zeigte nur die rote Statuszeile und versuchte endlos neu.
+- **Alarm:** Kommt von der Live-Kamera länger als 30 s kein Bild, erscheint oben ein roter Balken
+  „KEIN KAMERABILD seit …“, es piept alle 2 s und die Taskleiste blinkt. „Ton aus“ stellt den Ton ab;
+  der Balken bleibt, bis wieder Bilder kommen. Schwelle: `"kamera": {"alarm_s": 30}` in `settings.json`.
+- Die Lücke steht im laufenden Run als Ereignis `camera_lost` / `camera_back` (mit Dauer), auch im
+  Journal, und in `kamera.log`.
+- **DirectShow einstellbar:** Haken „Über DirectShow öffnen (ohne Windows-Kameradienst)“ im Kamera-Bereich.
+  Dann läuft die Kamera nicht über den Windows-Kameradienst (FrameServer), der hier regelmäßig im
+  AMD-Treiber abstürzt. Wird in `settings.json` gespeichert und gilt ab dem nächsten Start der Kamera.
+- Eine schon über DirectShow laufende Kamera (auch ein eingetipptes `701`) springt nach einem Abbruch
+  nicht mehr zuerst auf Media Foundation.
+- **Keine Stapel hängender Versuche:** Hängen schon zwei Verbindungsversuche im Treiber (oder lässt sich
+  ein Hilfsprozess nicht beenden), startet die App keinen weiteren, bis einer endet. Die Pausen zwischen
+  Fehlversuchen wachsen bis 30 s.
+
 ## 2026-11-02
 
 ### Kamera: schneller wieder verbunden, Ausfälle im Log

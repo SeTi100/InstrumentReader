@@ -1,15 +1,17 @@
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox, QInputDialog
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QMenuBar, QMenu, QFileDialog, QMessageBox,
+    QInputDialog, QLabel, QPushButton, QApplication
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
-from instrument_reader.core import data_safety
+from instrument_reader.core import app_settings, data_safety
 from instrument_reader.core.ablesung import AblesungLog
 from instrument_reader.core.excel_link import ExcelError, ExcelLink, load_config, save_config
 from instrument_reader.gui import global_hotkeys
@@ -28,10 +30,13 @@ from instrument_reader.gui.export_dialog import ExportDialog
 from instrument_reader.gui.runs_dashboard import RunsDashboardDialog
 from instrument_reader.gui.roi_config_dialog import ROIConfigDialog
 from instrument_reader.gui.preprocessing_dialog import PreprocessingDialog
-from instrument_reader.gui.camera_thread import CameraThread
+from instrument_reader.gui.camera_thread import CameraThread, log as camera_log
+from instrument_reader.gui.camera_alarm import CameraAlarm
 from instrument_reader.core.camera_devices import label_name, parse_source
 
 EXCEL_POLL_MS = 700
+# settings.json section for the camera: {"directshow": bool, "alarm_s": seconds without a picture}
+CAMERA_SETTINGS_KEY = "kamera"
 
 
 class MainWindow(QMainWindow):
@@ -70,6 +75,18 @@ class MainWindow(QMainWindow):
         self._device_watch = QTimer(self)
         self._device_watch.setInterval(500)
         self._device_watch.timeout.connect(self.control_panel.refresh_cameras)
+
+        camera_settings = app_settings.load_section(self._settings_file(), CAMERA_SETTINGS_KEY)
+        self.control_panel.directshow_cb.setChecked(bool(camera_settings.get("directshow", False)))
+        self.control_panel.directshow_cb.toggled.connect(self._on_directshow_toggled)
+        try:
+            alarm_s = float(camera_settings.get("alarm_s", CameraAlarm.DEFAULT_THRESHOLD_S))
+        except (TypeError, ValueError):
+            alarm_s = CameraAlarm.DEFAULT_THRESHOLD_S
+        self.camera_alarm = CameraAlarm(alarm_s, parent=self)
+        self.camera_alarm.raised.connect(self._on_camera_alarm)
+        self.camera_alarm.ticked.connect(self._on_camera_alarm_tick)
+        self.camera_alarm.cleared.connect(self._on_camera_alarm_cleared)
         
         self.setup_connections()
         self.setup_menus()
@@ -86,7 +103,27 @@ class MainWindow(QMainWindow):
         top_splitter.addWidget(self.control_panel)
         top_splitter.setSizes([800, 400])
         
-        main_layout.addWidget(top_splitter)
+        # Red banner over everything while the live camera delivers no picture (CameraAlarm).
+        self.alarm_banner = QWidget()
+        self.alarm_banner.setStyleSheet("background: #c62828; color: white;")
+        banner_layout = QHBoxLayout(self.alarm_banner)
+        text_layout = QVBoxLayout()
+        self.alarm_label = QLabel("")
+        self.alarm_label.setStyleSheet("font-size: 18pt; font-weight: bold;")
+        alarm_hint = QLabel("Es werden keine Messwerte aufgenommen! Kamera, USB-Kabel und Netzteil prüfen.")
+        alarm_hint.setStyleSheet("font-size: 11pt;")
+        text_layout.addWidget(self.alarm_label)
+        text_layout.addWidget(alarm_hint)
+        self.alarm_ack_btn = QPushButton("Ton aus")
+        self.alarm_ack_btn.setToolTip("Stellt den Ton ab; die Meldung bleibt, bis wieder Bilder kommen.")
+        self.alarm_ack_btn.setStyleSheet("background: white; color: #c62828; font-weight: bold; padding: 6px 14px;")
+        self.alarm_ack_btn.clicked.connect(self._acknowledge_camera_alarm)
+        banner_layout.addLayout(text_layout, 1)
+        banner_layout.addWidget(self.alarm_ack_btn)
+        self.alarm_banner.setVisible(False)
+        main_layout.addWidget(self.alarm_banner)
+
+        main_layout.addWidget(top_splitter, 1)
         self.setCentralWidget(central)
         
     def setup_connections(self):
@@ -113,6 +150,7 @@ class MainWindow(QMainWindow):
                 self.camera.release()
                 self.camera = None
 
+            self.camera_alarm.unwatch()
             self.camera = OpenCVCamera(src)
             self.camera_thread = CameraThread(self.camera)
             self.camera_thread.frame_ready.connect(self.video_widget.update_frame)
@@ -133,7 +171,12 @@ class MainWindow(QMainWindow):
                 self._camera_name = next((n for n in map(label_name, labels) if n), None)
                 self.camera.name = self._camera_name
                 self.camera.route = self._camera_routes.get(self._camera_name, self.camera.route)
+                if self.control_panel.directshow_cb.isChecked():
+                    self.camera.avoid_frame_server()
                 self._device_watch.start()
+                # Direct connection: the alarm must notice pictures even when the GUI thread is busy.
+                self.camera_thread.frame_captured.connect(self.camera_alarm.frame_arrived, Qt.DirectConnection)
+                self.camera_alarm.watch()
             self.camera_thread.start()
             self.ocr_worker.start()
 
@@ -144,6 +187,7 @@ class MainWindow(QMainWindow):
                         self.camera_thread.pause()
                         return
                 self._device_watch.stop()
+                self.camera_alarm.unwatch()
                 self.camera_thread.stop()
                 self.camera_thread = None
                 self.camera = None
@@ -257,6 +301,51 @@ class MainWindow(QMainWindow):
         if state in ("connecting", "reconnecting"):
             # Without a live picture the OCR must not keep logging the last frame as current.
             self.ocr_worker.update_frame(None)
+
+    def _on_directshow_toggled(self, checked: bool):
+        settings = app_settings.load_section(self._settings_file(), CAMERA_SETTINGS_KEY)
+        settings["directshow"] = bool(checked)
+        try:
+            app_settings.save_section(self._settings_file(), CAMERA_SETTINGS_KEY, settings)
+        except OSError as e:
+            self.statusBar().showMessage(f"Kamera-Einstellung nicht gespeichert: {e}", 10000)
+            return
+        if self.camera_thread and self.camera_thread.running:
+            self.statusBar().showMessage("Gilt ab dem nächsten Start der Kamera (Stop, dann Start).", 10000)
+
+    def _on_camera_alarm(self, last_frame_epoch: float):
+        since = datetime.fromtimestamp(last_frame_epoch)
+        camera_log.error("ALARM: kein Kamerabild seit %s", since.strftime("%H:%M:%S"))
+        self.alarm_ack_btn.setEnabled(True)
+        self.alarm_banner.setVisible(True)
+        self._on_camera_alarm_tick(self.camera_alarm.silence_s())
+        self._note_camera_gap("camera_lost", since, f"kein Bild seit > {self.camera_alarm.threshold_s:.0f} s")
+
+    def _note_camera_gap(self, event: str, when: datetime, reason: str):
+        """Marks the gap in the current run; a database problem must never silence the alarm."""
+        try:
+            self.db_writer.add_run_event(event, when.isoformat(timespec="seconds"), reason)
+        except Exception:
+            camera_log.exception("Lücke nicht in der Datenbank vermerkt")
+
+    def _on_camera_alarm_tick(self, silent_s: float):
+        since = datetime.fromtimestamp(time.time() - silent_s).strftime("%H:%M:%S")
+        minutes, seconds = divmod(int(silent_s), 60)
+        self.alarm_label.setText(f"KEIN KAMERABILD seit {since} ({minutes}:{seconds:02d} min)")
+        if not self.camera_alarm.acknowledged:
+            QApplication.alert(self, 0)  # flash the taskbar entry until the window is activated
+
+    def _acknowledge_camera_alarm(self):
+        self.camera_alarm.acknowledge()
+        self.alarm_ack_btn.setEnabled(False)
+        camera_log.warning("Alarm quittiert (Ton aus)")
+
+    def _on_camera_alarm_cleared(self, lost_epoch: float, gap_s: float):
+        self.alarm_banner.setVisible(False)
+        back = datetime.fromtimestamp(lost_epoch + gap_s)
+        reason = f"{gap_s:.0f} s ohne Bild" + ("" if self.camera_alarm.watching else ", Kamera gestoppt")
+        camera_log.warning("Alarm beendet: %s", reason)
+        self._note_camera_gap("camera_back", back, reason)
 
     def toggle_recording(self):
         if not self.recorder.is_recording:
@@ -1093,6 +1182,7 @@ class MainWindow(QMainWindow):
         self._flashed = self.excel_link.unflash(self._flashed)
         if self.recorder.is_recording:
             self.recorder.stop_recording()
+        self.camera_alarm.unwatch()
         if self.camera_thread:
             self.camera_thread.stop()
             self.camera_thread = None

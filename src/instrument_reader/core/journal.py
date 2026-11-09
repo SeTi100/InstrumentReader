@@ -105,6 +105,9 @@ def rebuild_database(journal_folder: str | Path, target: str | Path) -> dict:
             elif ev == "run_resume":
                 conn.execute("UPDATE runs SET status = 'running', ended_at = NULL, end_reason = NULL WHERE id = ?", (e["id"],))
                 conn.execute("INSERT INTO run_events (run_id, time, event) VALUES (?, ?, 'resume')", (e["id"], e.get("time")))
+            elif ev == "run_event":
+                conn.execute("INSERT INTO run_events (run_id, time, event, reason) VALUES (?, ?, ?, ?)",
+                             (e["id"], e.get("time"), e.get("kind"), e.get("reason")))
             elif ev == "experiment_end":
                 conn.execute("UPDATE experiments SET status = 'closed', ended_at = ? WHERE id = ?", (e.get("ended_at"), e["id"]))
             elif ev == "experiment_reopen":
