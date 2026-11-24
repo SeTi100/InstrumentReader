@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from abc import ABC, abstractmethod
 
+from instrument_reader.core.camera_process import ProcessCapture, open_live_capture
+
 
 class CameraSource(ABC):
     @abstractmethod
@@ -92,6 +94,9 @@ class OpenCVCamera(CameraSource):
         # Device name, used to find the same camera in the other backend's list.
         self.name = name
         self.route = ROUTE_DIRECT
+        # Why the last open() failed: camera_process.FAIL_BUSY / FAIL_ABSENT, or None.
+        self.fail_reason: str | None = None
+        self._pending_frame: np.ndarray | None = None
 
     @property
     def source(self) -> int | str:
@@ -142,25 +147,30 @@ class OpenCVCamera(CameraSource):
         # the device locked for other applications (e.g. OBS) until the process exits.
         self.release()
         index, api = self._backend()
-        other = self.route == ROUTE_OTHER_BACKEND
+        other_first = self.route == ROUTE_OTHER_BACKEND
+        self.fail_reason = None
+        first_frame = None
+        used_other = False
         if self.uses_helper_process:
-            from instrument_reader.core.camera_process import ProcessCapture
-
-            cap = ProcessCapture(index, api, name=self.name, other_backend=other)
-        else:
-            from instrument_reader.core.camera_devices import resolve_capture_target
-
-            target = resolve_capture_target(index, api, self.name, other) if other else None
-            if target is not None:
-                cap = cv2.VideoCapture(target[0], target[1])
-            elif api is None:
-                cap = cv2.VideoCapture(index)
+            cap = ProcessCapture(index, api, name=self.name, other_backend=other_first)
+            if cap.isOpened():
+                used_other = cap.used_other_backend
             else:
-                cap = cv2.VideoCapture(index, api)
+                self.fail_reason = cap.fail_reason
+        elif self.is_video_file or not isinstance(index, int):
+            cap = cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
+        else:
+            cap, first_frame, used_other, self.fail_reason = open_live_capture(index, api, self.name, other_first)
+            if cap is None:
+                return False
         if not cap.isOpened():
             cap.release()
             return False
-        if self._api is None and _is_plain_index(self._source) and not other:
+        # The camera may have answered on the other backend only: remember that route, so
+        # reconnects (and the status line) use the way that works.
+        self.route = ROUTE_OTHER_BACKEND if used_other else ROUTE_DIRECT
+        self._pending_frame = first_frame
+        if self._api is None and _is_plain_index(self._source) and not used_other:
             # Reconnects must use the same backend, or a different device list applies.
             try:
                 self._api = _backend_id(cap.getBackendName())
@@ -181,6 +191,9 @@ class OpenCVCamera(CameraSource):
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._cap is None:
             return False, None
+        if self._pending_frame is not None:
+            frame, self._pending_frame = self._pending_frame, None
+            return True, frame
         return self._cap.read()
 
     def release(self) -> None:
@@ -188,6 +201,7 @@ class OpenCVCamera(CameraSource):
         if cap is not None:
             cap.release()
         self._cached_fps = None
+        self._pending_frame = None
 
     @property
     def is_opened(self) -> bool:

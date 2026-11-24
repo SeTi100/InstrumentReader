@@ -219,6 +219,9 @@ def test_reconnect_keeps_backend(monkeypatch):
         def get(self, prop):
             return 30.0
 
+        def read(self):
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
         def release(self):
             pass
 
@@ -564,3 +567,129 @@ def test_camera_log_records_dropouts(qtbot, fast_thread, tmp_path):
     assert "Verbindung abgebrochen" in text
     assert "reconnecting: Verbindung unterbrochen" in text
     assert text.count("connected: Kamera verbunden") == 2
+
+
+class _BusyCap:
+    """A camera another program holds: Media Foundation opens it, but every grab fails."""
+
+    def __init__(self, delivers):
+        self.delivers = delivers
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        return (True, np.ones((2, 2, 3), dtype=np.uint8)) if self.delivers else (False, None)
+
+    def getBackendName(self):
+        return "MSMF"
+
+    def get(self, prop):
+        return 30.0
+
+    def release(self):
+        self.released = True
+
+
+def _fake_backends(monkeypatch, msmf_delivers, dshow_listed=True, dshow_delivers=True):
+    import cv2
+    from instrument_reader.core import camera_devices
+
+    opened = []
+
+    def capture(*args):
+        backend = args[1] if len(args) > 1 else cv2.CAP_MSMF
+        cap = _BusyCap(msmf_delivers if backend == cv2.CAP_MSMF else dshow_delivers)
+        opened.append((args, cap))
+        return cap
+
+    monkeypatch.setattr(cv2, "VideoCapture", capture)
+    monkeypatch.setattr(camera_devices, "resolve_capture_target",
+                        lambda i, a, n, o: (1, cv2.CAP_DSHOW) if o and dshow_listed else None)
+    return opened
+
+
+def test_busy_camera_falls_back_to_other_backend_at_once(monkeypatch):
+    """No reconnect cycle: the other backend is tried within the same open()."""
+    import cv2
+    from instrument_reader.core.camera import OpenCVCamera
+
+    opened = _fake_backends(monkeypatch, msmf_delivers=False)
+    monkeypatch.setattr(OpenCVCamera, "USE_HELPER_PROCESS", False)
+    cam = OpenCVCamera(0, cv2.CAP_MSMF, name="PC-LM1E Camera")
+    assert cam.open() is True
+    assert cam.route == "other" and cam.fail_reason is None
+    assert [args for args, _ in opened] == [(0, cv2.CAP_MSMF), (1, cv2.CAP_DSHOW)]
+    assert opened[0][1].released  # the busy handle is not kept
+    ok, frame = cam.read()  # the frame that proved the route is not lost
+    assert ok and frame.shape == (2, 2, 3)
+    cam.release()
+
+
+def test_busy_on_all_backends_is_reported(monkeypatch):
+    import cv2
+    from instrument_reader.core.camera import OpenCVCamera
+    from instrument_reader.core.camera_process import FAIL_ABSENT, FAIL_BUSY
+
+    monkeypatch.setattr(OpenCVCamera, "USE_HELPER_PROCESS", False)
+    _fake_backends(monkeypatch, msmf_delivers=False, dshow_delivers=False)
+    cam = OpenCVCamera(0, cv2.CAP_MSMF)
+    assert cam.open() is False and cam.fail_reason == FAIL_BUSY
+
+    class Closed(_BusyCap):
+        def isOpened(self):
+            return False
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a: Closed(False))
+    assert cam.open() is False and cam.fail_reason == FAIL_ABSENT
+
+
+class BusyCamera(FakeCamera):
+    def open(self):
+        self.fail_reason = "busy"
+        return False
+
+    def clone(self):
+        return BusyCamera(self.device, self.source)
+
+
+def test_busy_camera_shows_clear_status_quickly(qtbot, fast_thread):
+    thread = CameraThread(BusyCamera(FakeDevice()))
+    messages = []
+    thread.status_changed.connect(lambda st, msg: messages.append(msg))
+    thread.start()
+    try:
+        qtbot.waitUntil(lambda: CameraThread.BUSY_MESSAGE in messages, timeout=2000)
+        threading.Event().wait(0.3)
+        assert messages.count(CameraThread.BUSY_MESSAGE) == 1  # no flicker while it retries
+    finally:
+        thread.stop()
+
+
+def test_helper_reports_busy_camera(tmp_path):
+    """A source that opens but has no frames comes back as failed, not as a dead stream."""
+    from instrument_reader.core.camera_process import FAIL_ABSENT, ProcessCapture
+
+    cap = ProcessCapture(str(tmp_path / "missing.avi"))
+    assert cap.isOpened() is False and cap.fail_reason == FAIL_ABSENT
+
+
+def test_second_instance_is_detected(qtbot, tmp_path):
+    from instrument_reader.app import acquire_instance_lock
+
+    first = acquire_instance_lock(str(tmp_path))
+    assert first is not None
+    assert acquire_instance_lock(str(tmp_path)) is None
+    first.unlock()
+    again = acquire_instance_lock(str(tmp_path))
+    assert again is not None
+    again.unlock()
+
+
+def test_opencv_console_warnings_are_off_by_default():
+    import os
+
+    import instrument_reader  # noqa: F401
+
+    assert os.environ.get("OPENCV_LOG_LEVEL")

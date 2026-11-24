@@ -22,47 +22,108 @@ READ_TIMEOUT_S = 2.0
 MAX_READ_FAILURES = 3
 
 
-def _capture_loop(source, api, name, other_backend, conn, stop):
-    try:
-        import cv2
+# Why a camera could not be opened (OpenCVCamera.fail_reason).
+FAIL_BUSY = "busy"        # the device opened but delivered no frame: usually in use elsewhere
+FAIL_ABSENT = "absent"    # no route could open the device at all
 
-        from instrument_reader.core.camera_devices import device_name, resolve_capture_target
 
-        target = resolve_capture_target(source, api, name, other_backend) if isinstance(source, int) else None
-        if other_backend and target is None:
-            conn.send(("failed", None))
-            return
-        if target is not None:
+def open_live_capture(source, api, name, other_first):
+    """Opens a camera on the first route that delivers a frame.
+
+    Tries the chosen route, then (Windows, camera index) the same camera by name through
+    the other backend. A device that opens but fails its first reads - typical when another
+    program (or a second InstrumentReader window) holds the camera: Media Foundation then
+    reports MF_E_HW_MFT_FAILED_START_STREAMING - counts as failed, so the fallback takes
+    milliseconds instead of a reconnect cycle.
+
+    Returns (cap, first_frame, used_other_backend, fail_reason); cap is None on failure.
+    """
+    import cv2
+
+    from instrument_reader.core.camera_devices import resolve_capture_target
+
+    routes = [other_first, not other_first] if isinstance(source, int) else [False]
+    reason = FAIL_ABSENT
+    for other in routes:
+        if other:
+            target = resolve_capture_target(source, api, name, True)
+            if target is None:
+                continue
             cap = cv2.VideoCapture(*target)
         else:
             cap = cv2.VideoCapture(source) if api is None else cv2.VideoCapture(source, api)
         if not cap.isOpened():
-            conn.send(("failed", None))
+            cap.release()
+            continue
+        for _ in range(MAX_READ_FAILURES):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                return cap, frame, other, None
+        if isinstance(source, str):
+            # A video file that opens but has no frames is simply empty.
+            return cap, None, other, None
+        log.info("Kamera %s (%s) öffnet, liefert aber keine Bilder", source,
+                 "anderer Weg" if other else "normaler Weg")
+        cap.release()
+        reason = FAIL_BUSY
+    return None, None, False, reason
+
+
+def _exit_with_parent():
+    """Ends the helper as soon as the app is gone, even while a read hangs in the driver;
+    an orphaned helper would keep the camera locked for every later start."""
+    import os
+    import threading
+
+    parent = mp.parent_process()
+    if parent is None:
+        return
+
+    def watch():
+        parent.join()
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
+def _capture_loop(source, api, name, other_backend, conn, stop):
+    try:
+        _exit_with_parent()
+        import cv2
+
+        from instrument_reader.core.camera_devices import device_name
+
+        cap, frame, used_other, reason = open_live_capture(source, api, name, other_backend)
+        if cap is None:
+            conn.send(("failed", reason))
             return
         try:
             backend = cap.getBackendName()
         except cv2.error:
             backend = ""
-        if name is None and isinstance(source, int) and target is None:
+        if name is None and isinstance(source, int) and not used_other:
             try:
                 name = device_name(source, api if api is not None else getattr(cv2, f"CAP_{backend}", None))
             except Exception:
                 name = None
-        conn.send(("opened", (float(cap.get(cv2.CAP_PROP_FPS) or 0.0), backend, name)))
+        conn.send(("opened", (float(cap.get(cv2.CAP_PROP_FPS) or 0.0), backend, name, used_other)))
         failures = 0
         while not stop.is_set():
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                failures += 1
-                if failures >= MAX_READ_FAILURES:
-                    break
-                continue
+            if frame is None:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    frame = None
+                    failures += 1
+                    if failures >= MAX_READ_FAILURES:
+                        break
+                    continue
             failures = 0
             frame = np.ascontiguousarray(frame)
             conn.send(("frame", (frame.shape, frame.dtype.str)))
             # Flat byte view: for a 3-D array len() counts rows, not bytes, which breaks
             # send_bytes on Windows pipes for frames larger than one write.
             conn.send_bytes(memoryview(frame).cast("B"))
+            frame = None
         cap.release()
     except (EOFError, OSError):
         pass
@@ -86,6 +147,8 @@ class ProcessCapture:
         self._fps = 0.0
         self._backend = ""
         self.device_name = name
+        self.used_other_backend = False
+        self.fail_reason = None
         self._opened = False
         try:
             self._proc.start()
@@ -96,12 +159,15 @@ class ProcessCapture:
         child_conn.close()
         kind, payload = self._recv(START_TIMEOUT_S)
         if kind == "opened":
-            self._fps, self._backend, self.device_name = payload
+            self._fps, self._backend, self.device_name, self.used_other_backend = payload
             self._opened = True
         else:
+            self.fail_reason = payload if kind == "failed" else None
             log.warning("Hilfsprozess: Kamera %s (Backend %s%s) %s", source, api,
                         ", anderer Weg" if other_backend else "",
-                        "meldet sich nicht" if kind is None else "lässt sich nicht öffnen")
+                        "meldet sich nicht" if kind is None
+                        else "ist belegt (öffnet, liefert keine Bilder)" if payload == FAIL_BUSY
+                        else "lässt sich nicht öffnen")
             self.release()
 
     def _recv(self, timeout: float):
