@@ -87,6 +87,8 @@ class CameraThread(QThread):
     # Route the camera uses unless told otherwise (OpenCVCamera's ROUTE_DIRECT).
     DIRECT_ROUTE = "direct"
     STOP_JOIN_TIMEOUT_S = 1.0
+    BUSY_MESSAGE = ("Kamera belegt – sie liefert kein Bild. Läuft sie schon in einem anderen Programm "
+                    "(zweites InstrumentReader-Fenster, OBS, Teams, Kamera-App)? Versuche weiter …")
     # Max. rate of GUI frame updates while a video runs unpaced
     DISPLAY_INTERVAL_S = 1.0 / 30.0
 
@@ -273,6 +275,7 @@ class CameraThread(QThread):
                     # Stop the old session (it releases its handle as soon as the driver
                     # lets go) and immediately start over with a fresh connection.
                     was_live = session.last_frame_at is not None
+                    busy = not was_live and getattr(session.camera, "fail_reason", None) == "busy"
                     log.warning("Verbindung %s (%s, Versuch %d)",
                                 "abgebrochen" if was_live else "nicht zustande gekommen",
                                 "Sitzung beendet" if session.done else "keine Bilder mehr", attempt)
@@ -285,7 +288,11 @@ class CameraThread(QThread):
                         # attempt on that route hangs until its timeout. The other backend does
                         # not depend on it, so try that first.
                         log.info("Abbruch auf dem normalen Weg, versuche sofort Weg %s", self.camera.next_route())
-                    if ever_connected:
+                    if busy:
+                        # Opens but sends no picture on any route: almost always another program
+                        # (or a second InstrumentReader window) is using the camera.
+                        self._set_state("reconnecting" if ever_connected else "connecting", self.BUSY_MESSAGE)
+                    elif ever_connected:
                         self._set_state("reconnecting", f"Verbindung unterbrochen – verbinde neu (Versuch {attempt + 1}) …")
                     else:
                         self._set_state("connecting", f"Kamera nicht erreichbar – neuer Versuch ({attempt + 1}) …")

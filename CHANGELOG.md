@@ -3,6 +3,23 @@
 Alle nennenswerten Änderungen an InstrumentReader. Neueste Einträge oben.
 Gruppiert nach Datum, solange die Versionsnummer bei 0.1.0 steht.
 
+## 2026-11-24
+
+### Kamera belegt: klare Meldung statt Warnflut
+- **Zweites Programmfenster:** Läuft InstrumentReader schon (evtl. minimiert), fragt ein zweiter Start
+  nach („Beenden“ / „Trotzdem starten“), statt still ein zweites Fenster zu öffnen, das keine Kamera
+  bekommt. Eine nach einem Absturz liegengebliebene Sperre wird automatisch übernommen.
+- **Schneller Ersatzweg:** Öffnet die Kamera, liefert aber kein Bild (typisch, wenn ein anderes Programm
+  sie benutzt), probiert dieselbe Verbindung sofort den anderen Treiber (DirectShow bzw. Media Foundation),
+  ohne neuen Verbindungsversuch. Ergebnis in unter 2 s.
+- **Statuszeile:** „Kamera belegt – … Läuft sie schon in einem anderen Programm (zweites
+  InstrumentReader-Fenster, OBS, Teams, Kamera-App)?“, solange kein Treiber ein Bild liefert. Die App
+  versucht im Hintergrund weiter und verbindet sich, sobald die Kamera frei ist.
+- **Konsole ruhig:** OpenCVs Warnungen pro Fehlversuch (`cap_msmf … grabFrame`, `DSHOW … can't capture
+  by index`) sind aus. Mit `OPENCV_LOG_LEVEL=INFO` kommen sie zur Fehlersuche zurück.
+- Der Kamera-Hilfsprozess beendet sich, sobald die App weg ist, auch wenn er im Treiber hängt, und kann
+  so die Kamera nicht für spätere Starts blockieren.
+
 ## 2026-11-02
 
 ### Kamera: schneller wieder verbunden, Ausfälle im Log

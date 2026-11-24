@@ -2,6 +2,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 from PySide6.QtWidgets import QApplication, QMessageBox
 from .core import data_safety
 from .gui.main_window import MainWindow
@@ -71,8 +72,40 @@ def setup_camera_log(folder) -> None:
     log.addHandler(handler)
 
 
+INSTANCE_LOCK_NAME = "instrument_reader.lock"
+
+
+def acquire_instance_lock(folder=None):
+    """Locks out a second running copy of the app. Returns the held lock, or None if
+    another copy holds it. A lock left behind by a crashed copy is taken over."""
+    from PySide6.QtCore import QLockFile
+
+    path = os.path.join(folder or tempfile.gettempdir(), INSTANCE_LOCK_NAME)
+    lock = QLockFile(path)
+    lock.setStaleLockTime(0)  # stale = its process is gone, however old the file is
+    return lock if lock.tryLock(100) else None
+
+
+def confirm_second_instance(parent=None) -> bool:
+    """Asks whether to start although InstrumentReader already runs. False: quit."""
+    box = QMessageBox(QMessageBox.Warning, "InstrumentReader läuft bereits",
+                      "InstrumentReader ist schon geöffnet (evtl. minimiert oder hinter anderen Fenstern).",
+                      parent=parent)
+    box.setInformativeText(
+        "Ein zweites Fenster bekommt kein Kamerabild, solange das erste die Kamera benutzt, "
+        "und schreibt in dieselbe Datenbank. Bitte das offene Fenster benutzen.")
+    quit_btn = box.addButton("Beenden", QMessageBox.RejectRole)
+    box.addButton("Trotzdem starten", QMessageBox.DestructiveRole)
+    box.setDefaultButton(quit_btn)
+    box.exec()
+    return box.clickedButton() is not quit_btn
+
+
 def main():
     app = QApplication(sys.argv)
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None and not confirm_second_instance():
+        sys.exit(0)
     if not prepare_data():
         sys.exit(1)
     try:
